@@ -93,32 +93,69 @@ The UI follows a dark professional theme with the following design tokens:
 - **Staggered fade-ins** for card grids
 - **Force-directed graph** for mesh topology (pure Canvas 2D)
 
-## Quick Start
+## Download
+
+Pre-built binaries are available on the [Releases](https://github.com/ruvnet/RuView/releases) page.
+
+| Platform | Download | Status |
+|----------|----------|--------|
+| Windows x64 | [v0.3.0-alpha](https://github.com/ruvnet/RuView/releases/tag/v0.3.0-desktop-alpha) | Debug build |
+| macOS | — | Planned |
+| Linux | — | Planned |
+
+### Running the pre-built exe (Windows)
+
+The current release is a **debug build** that loads the frontend from a local Vite dev server. Follow these steps:
+
+```bash
+# 1. Clone the repo (or download just the ui/ folder)
+git clone https://github.com/ruvnet/RuView.git
+cd RuView/rust-port/wifi-densepose-rs/crates/wifi-densepose-desktop/ui
+
+# 2. Install frontend dependencies
+npm install
+
+# 3. Start the Vite dev server
+npx vite --host
+
+# 4. Download and run the exe from the release page
+#    (or run from the repo if you built it locally)
+#    The app window will open and connect to localhost:5173
+```
+
+> **Requirements:** Windows 10 (1803+) or Windows 11. WebView2 runtime is required (pre-installed on Windows 10 1803+ and all Windows 11).
+
+> **Note:** Production builds will bundle the frontend assets directly into the exe, removing the need for a dev server.
+
+## Build from Source
 
 ### Prerequisites
 
 - [Rust 1.85+](https://rustup.rs/)
 - [Node.js 20+](https://nodejs.org/)
 - [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)
+- **Windows:** MSVC build tools + MinGW-w64 (for `dlltool`)
+- **macOS:** Xcode Command Line Tools
+- **Linux:** `libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`
 
-### Development
+### Development mode
 
 ```bash
 # Install frontend dependencies
 cd ui && npm install
 
-# Start in dev mode (Vite + Tauri)
+# Start in dev mode (hot-reload on both Rust and React)
 cargo tauri dev
 ```
 
-### Build
+### Production build
 
 ```bash
-# Production build
+# Build optimized release with bundled frontend
 cargo tauri build
 ```
 
-The built installer will be in `target/release/bundle/`.
+The installer/bundle will be in `target/release/bundle/` (`.msi` on Windows, `.dmg` on macOS, `.deb`/`.AppImage` on Linux).
 
 ## Domain Types
 
