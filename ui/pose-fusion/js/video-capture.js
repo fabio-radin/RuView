@@ -126,12 +126,12 @@ export class VideoCapture {
   }
 
   /**
-   * Simple body detection from motion differencing.
-   * Returns approximate bounding box of moving region.
-   * @returns {{ x, y, w, h, detected: boolean }}
+   * Detect motion region + detailed motion grid for body-part tracking.
+   * Returns bounding box + a grid showing WHERE motion is concentrated.
+   * @returns {{ x, y, w, h, detected: boolean, motionGrid: number[][], gridCols: number, gridRows: number, exitDirection: string|null }}
    */
   detectMotionRegion(targetW = 56, targetH = 56) {
-    if (!this.isActive || !this.prevFrame) return { detected: false };
+    if (!this.isActive || !this.prevFrame) return { detected: false, motionGrid: null };
 
     this.offscreen.width = targetW;
     this.offscreen.height = targetH;
@@ -141,6 +141,17 @@ export class VideoCapture {
     let minX = targetW, minY = targetH, maxX = 0, maxY = 0;
     let motionPixels = 0;
     const threshold = 25;
+
+    // Motion grid: divide frame into cells and track motion intensity per cell
+    const gridCols = 10;
+    const gridRows = 8;
+    const cellW = targetW / gridCols;
+    const cellH = targetH / gridRows;
+    const motionGrid = Array.from({ length: gridRows }, () => new Float32Array(gridCols));
+    const cellPixels = cellW * cellH;
+
+    // Also track motion centroid weighted by intensity
+    let motionCxSum = 0, motionCySum = 0, motionWeightSum = 0;
 
     for (let y = 0; y < targetH; y++) {
       for (let x = 0; x < targetW; x++) {
@@ -156,17 +167,69 @@ export class VideoCapture {
           if (x > maxX) maxX = x;
           if (y > maxY) maxY = y;
         }
+
+        // Accumulate per-cell motion intensity
+        const gc = Math.min(Math.floor(x / cellW), gridCols - 1);
+        const gr = Math.min(Math.floor(y / cellH), gridRows - 1);
+        const intensity = diff / (3 * 255); // Normalize 0-1
+        motionGrid[gr][gc] += intensity / cellPixels;
+
+        // Weighted centroid
+        if (diff > threshold) {
+          motionCxSum += x * diff;
+          motionCySum += y * diff;
+          motionWeightSum += diff;
+        }
       }
     }
 
     const detected = motionPixels > (targetW * targetH * 0.02);
+
+    // Motion centroid (normalized 0-1)
+    const motionCx = motionWeightSum > 0 ? motionCxSum / (motionWeightSum * targetW) : 0.5;
+    const motionCy = motionWeightSum > 0 ? motionCySum / (motionWeightSum * targetH) : 0.5;
+
+    // Detect exit direction: if centroid is near edges
+    let exitDirection = null;
+    if (detected && motionCx < 0.1) exitDirection = 'left';
+    else if (detected && motionCx > 0.9) exitDirection = 'right';
+    else if (detected && motionCy < 0.1) exitDirection = 'up';
+    else if (detected && motionCy > 0.9) exitDirection = 'down';
+
+    // Track last known position for through-wall persistence
+    if (detected) {
+      this._lastDetected = {
+        x: minX / targetW,
+        y: minY / targetH,
+        w: (maxX - minX) / targetW,
+        h: (maxY - minY) / targetH,
+        cx: motionCx,
+        cy: motionCy,
+        exitDirection,
+        time: performance.now()
+      };
+    }
+
     return {
       detected,
       x: minX / targetW,
       y: minY / targetH,
       w: (maxX - minX) / targetW,
       h: (maxY - minY) / targetH,
-      coverage: motionPixels / (targetW * targetH)
+      coverage: motionPixels / (targetW * targetH),
+      motionGrid,
+      gridCols,
+      gridRows,
+      motionCx,
+      motionCy,
+      exitDirection
     };
+  }
+
+  /**
+   * Get the last known detection info (for through-wall persistence)
+   */
+  get lastDetection() {
+    return this._lastDetected || null;
   }
 }

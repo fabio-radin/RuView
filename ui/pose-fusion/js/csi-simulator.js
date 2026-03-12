@@ -68,13 +68,38 @@ export class CsiSimulator {
   get isLive() { return this.mode === 'live'; }
 
   /**
-   * Update person state from video detection (for correlated demo data)
+   * Update person state from video detection (for correlated demo data).
+   * When person exits frame, CSI maintains presence with slow decay
+   * (simulating through-wall sensing capability).
    */
   updatePersonState(presence, x, y, motion) {
-    this.personPresence = presence;
-    this.personX = x;
-    this.personY = y;
-    this.personMotion = motion;
+    if (presence > 0.1) {
+      // Person detected in video — update CSI state directly
+      this.personPresence = presence;
+      this.personX = x;
+      this.personY = y;
+      this.personMotion = motion;
+      this._lastSeenTime = performance.now();
+      this._lastSeenX = x;
+      this._lastSeenY = y;
+    } else if (this._lastSeenTime) {
+      // Person NOT in video — CSI "through-wall" persistence
+      const elapsed = (performance.now() - this._lastSeenTime) / 1000;
+      // CSI can sense through walls for ~10 seconds with decaying confidence
+      const decayRate = 0.15; // Lose ~15% per second
+      this.personPresence = Math.max(0, 1.0 - elapsed * decayRate);
+      // Position slowly drifts (person walking behind wall)
+      this.personX = this._lastSeenX;
+      this.personY = this._lastSeenY;
+      this.personMotion = Math.max(0, motion * 0.5 + this.personPresence * 0.2);
+
+      if (this.personPresence < 0.05) {
+        this._lastSeenTime = null;
+      }
+    } else {
+      this.personPresence = 0;
+      this.personMotion = 0;
+    }
   }
 
   /**

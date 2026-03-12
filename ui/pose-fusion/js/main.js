@@ -184,16 +184,13 @@ function mainLoop(timestamp) {
       motionRegion = videoCapture.detectMotionRegion(56, 56);
 
       // Feed motion to CSI simulator for correlated demo data
-      if (motionRegion.detected) {
-        csiSimulator.updatePersonState(
-          1.0,
-          motionRegion.x + motionRegion.w / 2,
-          motionRegion.y + motionRegion.h / 2,
-          frame.motion
-        );
-      } else {
-        csiSimulator.updatePersonState(0, 0.5, 0.5, 0);
-      }
+      // When detected=false, CSI simulator handles through-wall persistence
+      csiSimulator.updatePersonState(
+        motionRegion.detected ? 1.0 : 0,
+        motionRegion.detected ? motionRegion.x + motionRegion.w / 2 : 0.5,
+        motionRegion.detected ? motionRegion.y + motionRegion.h / 2 : 0.5,
+        frame.motion
+      );
 
       fusionEngine.updateConfidence(
         frame.brightness, frame.motion,
@@ -232,18 +229,27 @@ function mainLoop(timestamp) {
 
   // --- Pose Decode ---
   // For CSI-only mode, generate a synthetic motion region from CSI energy
-  if (mode === 'csi' && !motionRegion) {
+  if (mode === 'csi' && (!motionRegion || !motionRegion.detected)) {
     const csiPresence = csiSimulator.personPresence;
     if (csiPresence > 0.1) {
       motionRegion = {
         detected: true,
         x: 0.25, y: 0.15, w: 0.5, h: 0.7,
-        coverage: csiPresence
+        coverage: csiPresence,
+        motionGrid: null,
+        gridCols: 10,
+        gridRows: 8
       };
     }
   }
 
-  const keypoints = poseDecoder.decode(fusedEmb, motionRegion, elapsed);
+  // CSI state for through-wall tracking
+  const csiState = {
+    csiPresence: csiSimulator.personPresence,
+    isLive: csiSimulator.isLive
+  };
+
+  const keypoints = poseDecoder.decode(fusedEmb, motionRegion, elapsed, csiState);
 
   // --- Render Skeleton ---
   const labelMap = { dual: 'DUAL FUSION', video: 'VIDEO ONLY', csi: 'CSI ONLY' };
