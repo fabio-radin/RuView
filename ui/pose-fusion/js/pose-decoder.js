@@ -273,16 +273,6 @@ export class PoseDecoder {
     const lHandOpen = Math.min(1, leftArmRaise * 0.5 + lArmSpread * 0.5);
     const rHandOpen = Math.min(1, rightArmRaise * 0.5 + rArmSpread * 0.5);
 
-    // Left ankle/knee positions
-    const lAnkleX = cx - hipHalfW + legMotion.left * legSwing * 1.3;
-    const rAnkleX = cx + hipHalfW + legMotion.right * legSwing * 1.3;
-    const lKneeX = cx - hipHalfW + legMotion.left * legSwing;
-    const rKneeX = cx + hipHalfW + legMotion.right * legSwing;
-
-    // Neck (midpoint between shoulders)
-    const neckX = cx;
-    const neckY = shoulderY - P.headToShoulder * bodyH * 0.35;
-
     const keypoints = [
       // 0: nose
       { x: headX, y: headY + 0.01, confidence: 0.92 },

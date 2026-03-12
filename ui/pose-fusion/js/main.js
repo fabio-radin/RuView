@@ -4,12 +4,12 @@
  * Main orchestration: video capture → CNN embedding → CSI processing → fusion → rendering
  */
 
-import { VideoCapture } from './video-capture.js?v=6';
-import { CsiSimulator } from './csi-simulator.js?v=6';
-import { CnnEmbedder } from './cnn-embedder.js?v=6';
-import { FusionEngine } from './fusion-engine.js?v=6';
-import { PoseDecoder } from './pose-decoder.js?v=6';
-import { CanvasRenderer } from './canvas-renderer.js?v=6';
+import { VideoCapture } from './video-capture.js?v=7';
+import { CsiSimulator } from './csi-simulator.js?v=7';
+import { CnnEmbedder } from './cnn-embedder.js?v=7';
+import { FusionEngine } from './fusion-engine.js?v=7';
+import { PoseDecoder } from './pose-decoder.js?v=7';
+import { CanvasRenderer } from './canvas-renderer.js?v=7';
 
 // === State ===
 let mode = 'dual';  // 'dual' | 'video' | 'csi'
