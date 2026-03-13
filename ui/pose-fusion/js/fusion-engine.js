@@ -8,12 +8,14 @@
 export class FusionEngine {
   /**
    * @param {number} embeddingDim
+   * @param {object} opts
+   * @param {object} opts.wasmModule - RuVector WASM module for cosine_similarity etc.
    */
-  constructor(embeddingDim = 128) {
+  constructor(embeddingDim = 128, opts = {}) {
     this.embeddingDim = embeddingDim;
+    this.wasmModule = opts.wasmModule || null;
 
     // Learnable attention weights (initialized to balanced 0.5)
-    // In production, these would be loaded from trained JSON
     this.attentionWeights = new Float32Array(embeddingDim).fill(0.5);
 
     // Dynamic modality confidence [0, 1]
@@ -30,6 +32,9 @@ export class FusionEngine {
     this.recentFusedEmbeddings = [];
     this.maxHistory = 50;
   }
+
+  /** Set the WASM module reference (called after WASM loads) */
+  setWasmModule(mod) { this.wasmModule = mod; }
 
   /**
    * Update quality-based confidence scores
@@ -94,12 +99,11 @@ export class FusionEngine {
       fused[i] = alpha * videoEmb[i] + (1 - alpha) * csiEmb[i];
     }
 
-    // Re-normalize
-    let norm = 0;
-    for (let i = 0; i < dim; i++) norm += fused[i] * fused[i];
-    norm = Math.sqrt(norm);
-    if (norm > 1e-8) {
-      for (let i = 0; i < dim; i++) fused[i] /= norm;
+    // Re-normalize using WASM when available
+    if (this.wasmModule) {
+      try { this.wasmModule.normalize(fused); } catch (_) { this._jsNormalize(fused); }
+    } else {
+      this._jsNormalize(fused);
     }
 
     this._recordEmbedding(videoEmb, csiEmb, fused);
@@ -111,18 +115,19 @@ export class FusionEngine {
    * @returns {{ video: Array, csi: Array, fused: Array }}
    */
   getEmbeddingPoints() {
-    // Simple 2D projection using first two principal components (approximated)
+    // Sparse random projection: pick a few dimensions with fixed coefficients
+    // to get visible 2D spread (avoids cancellation from summing all 128 dims)
     const project = (emb) => {
       if (!emb || emb.length < 4) return null;
-      // Use pairs of dimensions as crude 2D projection
-      let x = 0, y = 0;
-      for (let i = 0; i < emb.length; i += 2) {
-        x += emb[i] * (i % 4 < 2 ? 1 : -1);
-        if (i + 1 < emb.length) {
-          y += emb[i + 1] * (i % 4 < 2 ? 1 : -1);
-        }
-      }
-      return [x * 2, y * 2]; // Scale for visibility
+      // Use 8 sparse dimensions with predetermined signs (seeded, not random)
+      const dim = emb.length;
+      const x = emb[0] * 3.2 - emb[3] * 2.8 + emb[7] * 2.1 - emb[12] * 1.9
+              + (dim > 30 ? emb[29] * 1.5 - emb[31] * 1.3 : 0)
+              + (dim > 60 ? emb[55] * 1.1 - emb[60] * 0.9 : 0);
+      const y = emb[1] * 3.0 - emb[5] * 2.5 + emb[9] * 2.3 - emb[15] * 1.7
+              + (dim > 40 ? emb[37] * 1.4 - emb[42] * 1.2 : 0)
+              + (dim > 80 ? emb[73] * 1.0 - emb[80] * 0.8 : 0);
+      return [x, y];
     };
 
     return {
@@ -141,6 +146,11 @@ export class FusionEngine {
     const c = this.recentCsiEmbeddings[this.recentCsiEmbeddings.length - 1];
     if (!v || !c) return 0;
 
+    // Use WASM cosine_similarity when available
+    if (this.wasmModule) {
+      try { return this.wasmModule.cosine_similarity(v, c); } catch (_) { /* fallback */ }
+    }
+
     let dot = 0, na = 0, nb = 0;
     for (let i = 0; i < v.length; i++) {
       dot += v[i] * c[i];
@@ -149,6 +159,13 @@ export class FusionEngine {
     }
     na = Math.sqrt(na); nb = Math.sqrt(nb);
     return (na > 1e-8 && nb > 1e-8) ? dot / (na * nb) : 0;
+  }
+
+  _jsNormalize(vec) {
+    let norm = 0;
+    for (let i = 0; i < vec.length; i++) norm += vec[i] * vec[i];
+    norm = Math.sqrt(norm);
+    if (norm > 1e-8) for (let i = 0; i < vec.length; i++) vec[i] /= norm;
   }
 
   _recordEmbedding(video, csi, fused) {

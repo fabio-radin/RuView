@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WiFi-DensePose — Dual-Modal Pose Estimation</title>
-  <link rel="stylesheet" href="pose-fusion/css/style.css">
+  <link rel="stylesheet" href="pose-fusion/css/style.css?v=12">
 </head>
 <body>
 
@@ -40,6 +40,7 @@
       <div class="video-overlay-label" id="mode-label">DUAL FUSION</div>
 
       <div id="camera-prompt" class="camera-prompt">
+        <div class="camera-prompt-label" id="prompt-mode-label">DUAL FUSION</div>
         <p>Enable your webcam for live video pose estimation.<br>
            Or switch to <strong>CSI Only</strong> mode for WiFi-based sensing.</p>
         <button id="start-camera-btn">Enable Camera</button>
@@ -78,7 +79,24 @@
       <div class="panel">
         <div class="panel-title">&#9670; CSI Amplitude Heatmap</div>
         <div class="csi-canvas-wrapper">
-          <canvas id="csi-canvas" width="320" height="120"></canvas>
+          <canvas id="csi-canvas" width="320" height="100"></canvas>
+        </div>
+      </div>
+
+      <!-- RSSI Signal Strength -->
+      <div class="panel">
+        <div class="panel-title">&#9670; RSSI Signal Strength</div>
+        <div class="rssi-row">
+          <div class="rssi-gauge">
+            <div class="rssi-bar-track">
+              <div class="rssi-bar-fill" id="rssi-bar" style="width:0%"></div>
+            </div>
+            <div class="rssi-values">
+              <span class="rssi-dbm" id="rssi-value">-- dBm</span>
+              <span class="rssi-quality" id="rssi-quality">--</span>
+            </div>
+          </div>
+          <canvas id="rssi-sparkline" width="160" height="32"></canvas>
         </div>
       </div>
 
@@ -86,7 +104,30 @@
       <div class="panel">
         <div class="panel-title">&#9670; Embedding Space (2D Projection)</div>
         <div class="embedding-canvas-wrapper">
-          <canvas id="embedding-canvas" width="320" height="140"></canvas>
+          <canvas id="embedding-canvas" width="320" height="100"></canvas>
+        </div>
+      </div>
+
+      <!-- RuVector Attention Pipeline -->
+      <div class="panel">
+        <div class="panel-title">&#9670; RuVector WASM Attention Pipeline</div>
+        <div class="rv-pipeline">
+          <div class="rv-stage" id="rv-flash">Flash</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-mha">MHA</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-hyp">Hyper</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-lin">Linear</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-moe">MoE</div>
+          <div class="rv-arrow">&rarr;</div>
+          <div class="rv-stage" id="rv-lg">L+G</div>
+        </div>
+        <div class="rv-stats">
+          <span>Energy: <span id="rv-energy" style="color:var(--green-glow)">--</span></span>
+          <span>Refinement: <span id="rv-refine" style="color:var(--cyan)">--</span></span>
+          <span>Pose Impact: <span id="rv-impact" style="color:var(--amber)">--</span></span>
         </div>
       </div>
 
@@ -144,17 +185,17 @@
     <div class="bottom-bar">
       <div>
         WiFi-DensePose &middot; Dual-Modal Pose Estimation &middot;
-        Architecture: MobileNet-V3 &times; 2 &rarr; Attention Fusion &rarr; 17-Keypoint COCO
+        Architecture: Conv2D &rarr; RuVector 6-Stage Attention (Flash+MHA+Hyperbolic+Linear+MoE+L/G) &rarr; Fusion &rarr; 26-Keypoint Pose
       </div>
       <div>
         <a href="https://github.com/ruvnet/wifi-densepose">GitHub</a> &middot;
-        CNN: ruvector-cnn (JS fallback) &middot;
+        CNN: <span id="cnn-backend">ruvector-cnn (loading…)</span> &middot;
         <a href="observatory.html">Observatory</a>
       </div>
     </div>
 
   </div><!-- /main-grid -->
 
-  <script type="module" src="pose-fusion/js/main.js"></script>
+  <script type="module" src="pose-fusion/js/main.js?v=12"></script>
 </body>
 </html>
