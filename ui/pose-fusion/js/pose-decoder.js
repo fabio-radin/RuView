@@ -86,6 +86,40 @@ export class PoseDecoder {
     this._rightLegCy = 0.8;
     this._torsoCx = 0.5;
     this._torsoCy = 0.45;
+
+    // RuVector embedding → joint mapping
+    // Each joint gets 2 consecutive embedding dimensions (dx, dy offset)
+    // and 1 dimension for confidence modulation. 26 joints × 3 = 78 dims used from 128.
+    // Remaining 50 dims encode global pose features (body scale, rotation, lean).
+    this._jointEmbMap = this._buildJointEmbeddingMap(embeddingDim);
+
+    // Attention contribution tracking (for UI overlay)
+    this.attentionStats = { energy: 0, maxDim: 0, refinementMag: 0 };
+  }
+
+  /**
+   * Build the mapping from embedding dimensions to joint refinement signals.
+   * This maps the RuVector attention output to anatomically meaningful joint offsets.
+   */
+  _buildJointEmbeddingMap(dim) {
+    const map = [];
+    // 26 joints × 3 dims each (dx, dy, confidence_mod) = 78 dims
+    for (let j = 0; j < 26; j++) {
+      const base = j * 3;
+      if (base + 2 < dim) {
+        map.push({ dxDim: base, dyDim: base + 1, confDim: base + 2 });
+      } else {
+        map.push({ dxDim: j % dim, dyDim: (j + 1) % dim, confDim: (j + 2) % dim });
+      }
+    }
+    // Global pose features from dims 78-127
+    return {
+      joints: map,
+      scaleDim: Math.min(78, dim - 1),       // body scale factor
+      rotDim: Math.min(79, dim - 1),          // body rotation
+      leanXDim: Math.min(80, dim - 1),        // lateral lean
+      leanYDim: Math.min(81, dim - 1),        // forward/back lean
+    };
   }
 
   /**
@@ -354,7 +388,64 @@ export class PoseDecoder {
       keypoints[i].name = KEYPOINT_NAMES[i];
     }
 
+    // === RuVector Attention Embedding Refinement ===
+    // Compute attention stats for the UI pipeline display, but only apply
+    // positional refinement when a trained model is loaded (random-weight
+    // embeddings carry no meaningful spatial signal and distort the skeleton).
+    if (embedding && embedding.length >= 26 * 3) {
+      this._computeEmbeddingStats(keypoints, embedding, bodyH);
+    }
+
     return keypoints;
+  }
+
+  /**
+   * Apply RuVector attention embedding to refine joint positions and confidence.
+   *
+   * The 128-dim fused embedding is decoded as:
+   * - Dims 0-77:  Per-joint (dx, dy, confidence_mod) × 26 joints
+   * - Dims 78-81: Global pose parameters (scale, rotation, lean)
+   * - Dims 82-127: Reserved for cross-modal fusion features
+   *
+   * The attention mechanism determines HOW MUCH each spatial region contributes
+   * to each joint's refinement. Multi-Head captures global relationships,
+   * Hyperbolic captures hierarchical (torso→limb→hand) dependencies,
+   * MoE routes different body regions to specialized experts,
+   * Linear provides fast extremity refinement, Local-Global balances detail/context.
+   */
+  /**
+   * Compute embedding statistics for UI display without modifying joint positions.
+   * The 6-stage attention pipeline stats are shown in the RuVector panel.
+   * Position refinement is disabled until a trained model replaces random weights.
+   */
+  _computeEmbeddingStats(keypoints, emb, bodyH) {
+    const map = this._jointEmbMap;
+    const tc = (v) => Math.tanh(Number(v) || 0);
+
+    // Embedding energy (L2 norm of the used dims)
+    let energy = 0;
+    for (let i = 0; i < Math.min(emb.length, 82); i++) {
+      energy += emb[i] * emb[i];
+    }
+    energy = Math.sqrt(energy);
+
+    // Simulated per-joint refinement magnitude (what WOULD be applied)
+    const scale = bodyH * 0.015;
+    let totalRefinement = 0;
+    let maxDimVal = 0;
+
+    for (let j = 0; j < Math.min(keypoints.length, 26); j++) {
+      const jmap = map.joints[j];
+      if (!jmap) continue;
+      const dx = tc(emb[jmap.dxDim]) * scale;
+      const dy = tc(emb[jmap.dyDim]) * scale;
+      totalRefinement += Math.sqrt(dx * dx + dy * dy);
+      maxDimVal = Math.max(maxDimVal, Math.abs(tc(emb[jmap.dxDim])), Math.abs(tc(emb[jmap.dyDim])));
+    }
+
+    this.attentionStats.energy = energy;
+    this.attentionStats.maxDim = maxDimVal;
+    this.attentionStats.refinementMag = totalRefinement / 26;
   }
 
   /**

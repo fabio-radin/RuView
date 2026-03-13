@@ -269,6 +269,68 @@ class WasmMoEAttention {
   }
 }
 
+class WasmLinearAttention {
+  constructor(dim, num_features) {
+    const ret = wasm().wasmlinearattention_new(dim, num_features || dim);
+    this.__wbg_ptr = ret >>> 0;
+    WasmLinearAttentionFinalization.register(this, this.__wbg_ptr, this);
+  }
+  free() {
+    const ptr = this.__wbg_ptr; this.__wbg_ptr = 0;
+    WasmLinearAttentionFinalization.unregister(this);
+    wasm().__wbg_wasmlinearattention_free(ptr, 0);
+  }
+  compute(query, keys, values) {
+    const retptr = wasm().__wbindgen_add_to_stack_pointer(-16);
+    try {
+      const ptr0 = passArrayF32ToWasm0(query, wasm().__wbindgen_export);
+      const len0 = WASM_VECTOR_LEN;
+      wasm().wasmlinearattention_compute(retptr, this.__wbg_ptr, ptr0, len0, addHeapObject(keys), addHeapObject(values));
+      var r0 = getDataViewMemory0().getInt32(retptr + 0, true);
+      var r1 = getDataViewMemory0().getInt32(retptr + 4, true);
+      var r2 = getDataViewMemory0().getInt32(retptr + 8, true);
+      var r3 = getDataViewMemory0().getInt32(retptr + 12, true);
+      if (r3) throw takeObject(r2);
+      var v1 = getArrayF32FromWasm0(r0, r1).slice();
+      wasm().__wbindgen_export4(r0, r1 * 4, 4);
+      return v1;
+    } finally {
+      wasm().__wbindgen_add_to_stack_pointer(16);
+    }
+  }
+}
+
+class WasmLocalGlobalAttention {
+  constructor(dim, local_window, global_tokens) {
+    const ret = wasm().wasmlocalglobalattention_new(dim, local_window || 4, global_tokens || 2);
+    this.__wbg_ptr = ret >>> 0;
+    WasmLocalGlobalAttentionFinalization.register(this, this.__wbg_ptr, this);
+  }
+  free() {
+    const ptr = this.__wbg_ptr; this.__wbg_ptr = 0;
+    WasmLocalGlobalAttentionFinalization.unregister(this);
+    wasm().__wbg_wasmlocalglobalattention_free(ptr, 0);
+  }
+  compute(query, keys, values) {
+    const retptr = wasm().__wbindgen_add_to_stack_pointer(-16);
+    try {
+      const ptr0 = passArrayF32ToWasm0(query, wasm().__wbindgen_export);
+      const len0 = WASM_VECTOR_LEN;
+      wasm().wasmlocalglobalattention_compute(retptr, this.__wbg_ptr, ptr0, len0, addHeapObject(keys), addHeapObject(values));
+      var r0 = getDataViewMemory0().getInt32(retptr + 0, true);
+      var r1 = getDataViewMemory0().getInt32(retptr + 4, true);
+      var r2 = getDataViewMemory0().getInt32(retptr + 8, true);
+      var r3 = getDataViewMemory0().getInt32(retptr + 12, true);
+      if (r3) throw takeObject(r2);
+      var v1 = getArrayF32FromWasm0(r0, r1).slice();
+      wasm().__wbindgen_export4(r0, r1 * 4, 4);
+      return v1;
+    } finally {
+      wasm().__wbindgen_add_to_stack_pointer(16);
+    }
+  }
+}
+
 // ── Standalone functions ──────────────────────────────────────────
 
 function cosine_similarity(a, b) {
@@ -317,6 +379,84 @@ function softmax(vec) {
   wasm().softmax(ptr0, len0, addHeapObject(vec));
 }
 
+function batch_normalize(vectors, epsilon) {
+  const retptr = wasm().__wbindgen_add_to_stack_pointer(-16);
+  try {
+    wasm().batch_normalize(retptr, addHeapObject(vectors), isLikeNone(epsilon) ? 0x100000001 : Math.fround(epsilon));
+    var r0 = getDataViewMemory0().getInt32(retptr + 0, true);
+    var r1 = getDataViewMemory0().getInt32(retptr + 4, true);
+    var r2 = getDataViewMemory0().getInt32(retptr + 8, true);
+    var r3 = getDataViewMemory0().getInt32(retptr + 12, true);
+    if (r3) throw takeObject(r2);
+    var v1 = getArrayF32FromWasm0(r0, r1).slice();
+    wasm().__wbindgen_export4(r0, r1 * 4, 4);
+    return v1;
+  } finally {
+    wasm().__wbindgen_add_to_stack_pointer(16);
+  }
+}
+
+function pairwise_distances(vectors) {
+  const retptr = wasm().__wbindgen_add_to_stack_pointer(-16);
+  try {
+    wasm().pairwise_distances(retptr, addHeapObject(vectors));
+    var r0 = getDataViewMemory0().getInt32(retptr + 0, true);
+    var r1 = getDataViewMemory0().getInt32(retptr + 4, true);
+    var r2 = getDataViewMemory0().getInt32(retptr + 8, true);
+    var r3 = getDataViewMemory0().getInt32(retptr + 12, true);
+    if (r3) throw takeObject(r2);
+    var v1 = getArrayF32FromWasm0(r0, r1).slice();
+    wasm().__wbindgen_export4(r0, r1 * 4, 4);
+    return v1;
+  } finally {
+    wasm().__wbindgen_add_to_stack_pointer(16);
+  }
+}
+
+function scaled_dot_attention(query, keys, values, scale) {
+  const retptr = wasm().__wbindgen_add_to_stack_pointer(-16);
+  try {
+    const ptr0 = passArrayF32ToWasm0(query, wasm().__wbindgen_export);
+    const len0 = WASM_VECTOR_LEN;
+    wasm().scaled_dot_attention(retptr, ptr0, len0, addHeapObject(keys), addHeapObject(values), isLikeNone(scale) ? 0x100000001 : Math.fround(scale));
+    var r0 = getDataViewMemory0().getInt32(retptr + 0, true);
+    var r1 = getDataViewMemory0().getInt32(retptr + 4, true);
+    var r2 = getDataViewMemory0().getInt32(retptr + 8, true);
+    var r3 = getDataViewMemory0().getInt32(retptr + 12, true);
+    if (r3) throw takeObject(r2);
+    var v1 = getArrayF32FromWasm0(r0, r1).slice();
+    wasm().__wbindgen_export4(r0, r1 * 4, 4);
+    return v1;
+  } finally {
+    wasm().__wbindgen_add_to_stack_pointer(16);
+  }
+}
+
+function attention_weights(scores, temperature) {
+  const ptr0 = passArrayF32ToWasm0(scores, wasm().__wbindgen_export);
+  const len0 = WASM_VECTOR_LEN;
+  wasm().attention_weights(ptr0, len0, addHeapObject(scores), isLikeNone(temperature) ? 0x100000001 : Math.fround(temperature));
+}
+
+function available_mechanisms() {
+  const ret = wasm().available_mechanisms();
+  return takeObject(ret);
+}
+
+function random_orthogonal_matrix(dim) {
+  const retptr = wasm().__wbindgen_add_to_stack_pointer(-16);
+  try {
+    wasm().random_orthogonal_matrix(retptr, dim);
+    var r0 = getDataViewMemory0().getInt32(retptr + 0, true);
+    var r1 = getDataViewMemory0().getInt32(retptr + 4, true);
+    var v1 = getArrayF32FromWasm0(r0, r1).slice();
+    wasm().__wbindgen_export4(r0, r1 * 4, 4);
+    return v1;
+  } finally {
+    wasm().__wbindgen_add_to_stack_pointer(16);
+  }
+}
+
 function rv_init() { wasm().init(); }
 
 function rv_version() {
@@ -338,10 +478,18 @@ exports.WasmMultiHeadAttention = WasmMultiHeadAttention;
 exports.WasmFlashAttention = WasmFlashAttention;
 exports.WasmHyperbolicAttention = WasmHyperbolicAttention;
 exports.WasmMoEAttention = WasmMoEAttention;
+exports.WasmLinearAttention = WasmLinearAttention;
+exports.WasmLocalGlobalAttention = WasmLocalGlobalAttention;
 exports.cosine_similarity = cosine_similarity;
 exports.normalize = normalize;
 exports.l2_norm = l2_norm;
 exports.softmax = softmax;
+exports.batch_normalize = batch_normalize;
+exports.pairwise_distances = pairwise_distances;
+exports.scaled_dot_attention = scaled_dot_attention;
+exports.attention_weights = attention_weights;
+exports.available_mechanisms = available_mechanisms;
+exports.random_orthogonal_matrix = random_orthogonal_matrix;
 exports.init = rv_init;
 exports.version = rv_version;
 
@@ -471,13 +619,24 @@ export default async function initWasm() {
 }
 
 // ── ESM re-exports ────────────────────────────────────────────────
+// Attention mechanism classes
 export const WasmMultiHeadAttention = _mod.WasmMultiHeadAttention;
 export const WasmFlashAttention = _mod.WasmFlashAttention;
 export const WasmHyperbolicAttention = _mod.WasmHyperbolicAttention;
 export const WasmMoEAttention = _mod.WasmMoEAttention;
+export const WasmLinearAttention = _mod.WasmLinearAttention;
+export const WasmLocalGlobalAttention = _mod.WasmLocalGlobalAttention;
+// Utility functions
 export const cosine_similarity = _mod.cosine_similarity;
 export const normalize = _mod.normalize;
 export const l2_norm = _mod.l2_norm;
 export const softmax = _mod.softmax;
+export const batch_normalize = _mod.batch_normalize;
+export const pairwise_distances = _mod.pairwise_distances;
+export const scaled_dot_attention = _mod.scaled_dot_attention;
+export const attention_weights = _mod.attention_weights;
+export const random_orthogonal_matrix = _mod.random_orthogonal_matrix;
+export const available_mechanisms = _mod.available_mechanisms;
+// Lifecycle
 export const init = _mod.init;
 export const version = _mod.version;

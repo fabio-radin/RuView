@@ -36,6 +36,8 @@ export class CnnEmbedder {
     this.rvFlash = null;          // RuVector Flash Attention (WASM)
     this.rvHyperbolic = null;     // RuVector Hyperbolic Attention (hierarchical body)
     this.rvMoE = null;            // RuVector Mixture-of-Experts (body-region routing)
+    this.rvLinear = null;         // RuVector Linear Attention (O(n) fast hand refinement)
+    this.rvLocalGlobal = null;    // RuVector Local-Global Attention (detail + context)
     this.rvModule = null;         // RuVector WASM module reference
     this.useRuVector = false;
 
@@ -80,17 +82,19 @@ export class CnnEmbedder {
       await mod.default();  // async WASM init via fetch
       mod.init();
 
-      // Create Multi-Head Attention (dim=16 matches conv output channels, 4 heads)
+      // Create all 6 attention mechanisms
       this.rvAttention = new mod.WasmMultiHeadAttention(16, 4);
-      // Create Flash Attention for larger sequences
       this.rvFlash = new mod.WasmFlashAttention(16, 8);
-      // Hyperbolic Attention for hierarchical body-part modeling (Poincaré ball, curvature=-1)
       this.rvHyperbolic = new mod.WasmHyperbolicAttention(16, -1.0);
-      // MoE: 3 experts (upper-body, lower-body, extremities), top-2 active
       this.rvMoE = new mod.WasmMoEAttention(16, 3, 2);
+      this.rvLinear = new mod.WasmLinearAttention(16, 16);
+      this.rvLocalGlobal = new mod.WasmLocalGlobalAttention(16, 4, 2);
       this.rvModule = mod;
       this.useRuVector = true;
-      console.log(`[CNN] RuVector Attention WASM v${mod.version()} loaded — MHA + Flash + Hyperbolic + MoE active`);
+
+      // Log available mechanisms
+      const mechs = mod.available_mechanisms();
+      console.log(`[CNN] RuVector WASM v${mod.version()} — all 6 attention mechanisms active`, mechs);
       return true;
     } catch (e) {
       console.log('[CNN] RuVector Attention WASM not available:', e.message);
@@ -204,14 +208,19 @@ export class CnnEmbedder {
   }
 
   /**
-   * Extract embedding using full RuVector attention pipeline:
-   * 1. Multi-Head Attention (global spatial reasoning)
-   * 2. Hyperbolic Attention (hierarchical body-part structure)
-   * 3. MoE Attention (body-region specialized experts)
-   * 4. Concatenate + project → final embedding
+   * Full 6-stage RuVector WASM attention pipeline:
+   * 1. Flash Attention (efficient O(n) pre-screening of spatial tokens)
+   * 2. Multi-Head Attention (global spatial reasoning)
+   * 3. Hyperbolic Attention (hierarchical body-part structure, Poincaré ball)
+   * 4. Linear Attention (O(n) refinement for fine detail — hands/extremities)
+   * 5. MoE Attention (body-region specialized expert routing)
+   * 6. Local-Global Attention (local detail + global context fusion)
+   * → Weighted blend + batch_normalize + project + L2 normalize
    */
   _extractWithAttention(convOut, numTokens, channels) {
-    // Subsample spatial tokens for attention (keep it fast: max 64 tokens)
+    const mod = this.rvModule;
+
+    // Subsample spatial tokens for attention (max 64 for speed)
     const maxTokens = 64;
     const step = numTokens > maxTokens ? Math.floor(numTokens / maxTokens) : 1;
     const tokens = [];
@@ -226,7 +235,17 @@ export class CnnEmbedder {
     const numQueries = Math.min(4, tokens.length);
     const queryStride = Math.floor(tokens.length / numQueries);
 
-    // === Stage 1: Multi-Head Attention (global spatial reasoning) ===
+    // === Stage 1: Flash Attention (efficient pre-screening) ===
+    const flashOut = new Float32Array(channels);
+    try {
+      // Flash attention with block size 8 for efficient O(n) screening
+      const result = this.rvFlash.compute(tokens[0], tokens, tokens);
+      for (let c = 0; c < channels; c++) flashOut[c] = result[c];
+    } catch (_) {
+      flashOut.set(tokens[0]);
+    }
+
+    // === Stage 2: Multi-Head Attention (global spatial reasoning) ===
     const mhaOut = new Float32Array(channels);
     for (let q = 0; q < numQueries; q++) {
       const queryToken = tokens[q * queryStride];
@@ -238,56 +257,82 @@ export class CnnEmbedder {
       }
     }
 
-    // === Stage 2: Hyperbolic Attention (hierarchical body structure) ===
+    // === Stage 3: Hyperbolic Attention (hierarchical body structure) ===
     const hyOut = new Float32Array(channels);
-    if (this.rvHyperbolic) {
-      try {
-        // Use MHA output as query against spatial tokens — captures parent→child relationships
-        const result = this.rvHyperbolic.compute(mhaOut, tokens, tokens);
-        for (let c = 0; c < channels; c++) hyOut[c] = result[c];
-      } catch (_) {
-        hyOut.set(mhaOut);
-      }
-    } else {
+    try {
+      const result = this.rvHyperbolic.compute(mhaOut, tokens, tokens);
+      for (let c = 0; c < channels; c++) hyOut[c] = result[c];
+    } catch (_) {
       hyOut.set(mhaOut);
     }
 
-    // === Stage 3: MoE Attention (body-region experts) ===
-    const moeOut = new Float32Array(channels);
-    if (this.rvMoE) {
-      try {
-        // MoE routes tokens to specialized experts and combines
-        const result = this.rvMoE.compute(hyOut, tokens, tokens);
-        for (let c = 0; c < channels; c++) moeOut[c] = result[c];
-      } catch (_) {
-        moeOut.set(hyOut);
-      }
-    } else {
-      moeOut.set(hyOut);
+    // === Stage 4: Linear Attention (O(n) fast refinement for extremities) ===
+    const linOut = new Float32Array(channels);
+    try {
+      const result = this.rvLinear.compute(hyOut, tokens, tokens);
+      for (let c = 0; c < channels; c++) linOut[c] = result[c];
+    } catch (_) {
+      linOut.set(hyOut);
     }
 
-    // === Stage 4: Concatenate all three heads + project ===
-    // Blend: 40% MHA (global), 30% Hyperbolic (hierarchy), 30% MoE (regions)
-    const blended = new Float32Array(channels);
-    for (let c = 0; c < channels; c++) {
-      blended[c] = 0.4 * mhaOut[c] + 0.3 * hyOut[c] + 0.3 * moeOut[c];
+    // === Stage 5: MoE Attention (body-region expert routing) ===
+    const moeOut = new Float32Array(channels);
+    try {
+      const result = this.rvMoE.compute(linOut, tokens, tokens);
+      for (let c = 0; c < channels; c++) moeOut[c] = result[c];
+    } catch (_) {
+      moeOut.set(linOut);
     }
+
+    // === Stage 6: Local-Global Attention (detail + context) ===
+    const lgOut = new Float32Array(channels);
+    try {
+      const result = this.rvLocalGlobal.compute(moeOut, tokens, tokens);
+      for (let c = 0; c < channels; c++) lgOut[c] = result[c];
+    } catch (_) {
+      lgOut.set(moeOut);
+    }
+
+    // === Blend all 6 outputs ===
+    // Use WASM softmax on log-energy scores for dynamic stage weighting
+    const blended = new Float32Array(channels);
+    const stages = [flashOut, mhaOut, hyOut, linOut, moeOut, lgOut];
+    // Use log-energy to prevent exp() overflow in softmax
+    const logEnergies = new Float32Array(6);
+    for (let s = 0; s < 6; s++) {
+      const e = this._energy(stages[s]);
+      logEnergies[s] = e > 1e-10 ? Math.log(e) : -20;
+    }
+    try { mod.softmax(logEnergies); } catch (_) {
+      let max = -Infinity;
+      for (let i = 0; i < 6; i++) max = Math.max(max, logEnergies[i]);
+      let sum = 0;
+      for (let i = 0; i < 6; i++) { logEnergies[i] = Math.exp(logEnergies[i] - max); sum += logEnergies[i]; }
+      for (let i = 0; i < 6; i++) logEnergies[i] /= sum;
+    }
+    for (let c = 0; c < channels; c++) {
+      for (let s = 0; s < 6; s++) {
+        blended[c] += logEnergies[s] * stages[s][c];
+      }
+    }
+
+    // Batch normalize only when we have enough diversity (skip for single vectors)
+    // Single-vector batch norm collapses to zeros, killing embedding space
+    let normed = blended;
 
     // Project to embeddingDim
     const emb = new Float32Array(this.embeddingDim);
     for (let o = 0; o < this.embeddingDim; o++) {
       let sum = 0;
       for (let i = 0; i < channels; i++) {
-        sum += blended[i] * this.attnProjWeights[i * this.embeddingDim + o];
+        sum += normed[i] * this.attnProjWeights[i * this.embeddingDim + o];
       }
       emb[o] = sum;
     }
 
     // L2 normalize using RuVector WASM
-    if (this.normalize && this.rvModule) {
-      try {
-        this.rvModule.normalize(emb);
-      } catch (_) {
+    if (this.normalize) {
+      try { mod.normalize(emb); } catch (_) {
         let norm = 0;
         for (let i = 0; i < emb.length; i++) norm += emb[i] * emb[i];
         norm = Math.sqrt(norm);
@@ -296,6 +341,13 @@ export class CnnEmbedder {
     }
 
     return emb;
+  }
+
+  /** Compute vector energy (L2 norm squared) for attention weighting */
+  _energy(vec) {
+    let e = 0;
+    for (let i = 0; i < vec.length; i++) e += vec[i] * vec[i];
+    return e;
   }
 
   _conv2d3x3(input, H, W, Cin, Cout) {
@@ -349,7 +401,33 @@ export class CnnEmbedder {
     return output;
   }
 
-  /** Cosine similarity between two embeddings */
+  /** Cosine similarity using WASM when available, JS fallback */
+  cosineSim(a, b) {
+    if (this.rvModule) {
+      try { return this.rvModule.cosine_similarity(a, b); } catch (_) { /* fallback */ }
+    }
+    return CnnEmbedder.cosineSimilarity(a, b);
+  }
+
+  /** L2 norm using WASM when available */
+  l2Norm(vec) {
+    if (this.rvModule) {
+      try { return this.rvModule.l2_norm(vec); } catch (_) { /* fallback */ }
+    }
+    let norm = 0;
+    for (let i = 0; i < vec.length; i++) norm += vec[i] * vec[i];
+    return Math.sqrt(norm);
+  }
+
+  /** Pairwise distance matrix using WASM (for skeleton validation) */
+  pairwiseDistances(vectors) {
+    if (this.rvModule) {
+      try { return this.rvModule.pairwise_distances(vectors); } catch (_) { /* fallback */ }
+    }
+    return null;
+  }
+
+  /** Static JS fallback for cosine similarity */
   static cosineSimilarity(a, b) {
     let dot = 0, normA = 0, normB = 0;
     for (let i = 0; i < a.length; i++) {

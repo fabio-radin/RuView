@@ -184,14 +184,19 @@ body {
 
 .camera-prompt {
   position: absolute;
-  top: 50%; left: 50%;
-  transform: translate(-50%, -50%);
+  top: 0; left: 0; right: 0; bottom: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   text-align: center;
   color: var(--text-secondary);
+  padding: 24px;
+  z-index: 6;
 }
 
 .camera-prompt button {
-  margin-top: 12px;
+  margin-top: 16px;
   padding: 10px 24px;
   background: var(--green-glow);
   color: #000;
@@ -205,6 +210,16 @@ body {
 }
 
 .camera-prompt button:hover { background: var(--green-bright); }
+
+.camera-prompt-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  color: var(--green-glow);
+  text-shadow: 0 0 12px rgba(0,216,120,0.4);
+  margin-bottom: 12px;
+}
 
 /* === Side Panels === */
 .side-panels {
@@ -306,6 +321,44 @@ body {
 .embedding-canvas-wrapper canvas {
   width: 100%;
   display: block;
+}
+
+/* === RuVector Pipeline === */
+.rv-pipeline {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.rv-stage {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  background: rgba(0,210,120,0.12);
+  border: 1px solid rgba(0,210,120,0.3);
+  color: var(--green-glow);
+  transition: all 0.3s;
+}
+
+.rv-stage.active {
+  background: rgba(0,210,120,0.25);
+  box-shadow: 0 0 6px rgba(0,210,120,0.3);
+}
+
+.rv-arrow {
+  font-size: 10px;
+  color: var(--text-label);
+}
+
+.rv-stats {
+  display: flex;
+  gap: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-secondary);
 }
 
 /* === Latency Panel === */

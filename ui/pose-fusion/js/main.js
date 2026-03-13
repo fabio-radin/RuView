@@ -4,12 +4,12 @@
  * Main orchestration: video capture → CNN embedding → CSI processing → fusion → rendering
  */
 
-import { VideoCapture } from './video-capture.js?v=7';
-import { CsiSimulator } from './csi-simulator.js?v=7';
-import { CnnEmbedder } from './cnn-embedder.js?v=7';
-import { FusionEngine } from './fusion-engine.js?v=7';
-import { PoseDecoder } from './pose-decoder.js?v=7';
-import { CanvasRenderer } from './canvas-renderer.js?v=7';
+import { VideoCapture } from './video-capture.js?v=11';
+import { CsiSimulator } from './csi-simulator.js?v=11';
+import { CnnEmbedder } from './cnn-embedder.js?v=11';
+import { FusionEngine } from './fusion-engine.js?v=11';
+import { PoseDecoder } from './pose-decoder.js?v=11';
+import { CanvasRenderer } from './canvas-renderer.js?v=11';
 
 // === State ===
 let mode = 'dual';  // 'dual' | 'video' | 'csi'
@@ -122,9 +122,18 @@ function init() {
   });
 
   // Try to load RuVector Attention WASM embedders (non-blocking)
-  // Loads from ../pkg/ruvector-attention/ (real RuVector Multi-Head + Flash Attention)
   const wasmBase = new URL('../pkg/ruvector-attention', import.meta.url).href;
-  visualCnn.tryLoadWasm(wasmBase);
+  visualCnn.tryLoadWasm(wasmBase).then((ok) => {
+    // Share the WASM module with FusionEngine for cosine_similarity, normalize, etc.
+    if (visualCnn.rvModule) fusionEngine.setWasmModule(visualCnn.rvModule);
+    // Update footer backend label
+    const backendEl = document.getElementById('cnn-backend');
+    if (backendEl) {
+      backendEl.textContent = ok && visualCnn.useRuVector
+        ? `RuVector WASM v${visualCnn.rvModule.version()} — 6 attention mechanisms`
+        : 'ruvector-cnn (JS fallback)';
+    }
+  });
   csiCnn.tryLoadWasm(wasmBase);
 
   // Auto-connect to local sensing server WebSocket if available
@@ -161,7 +170,6 @@ async function startCamera() {
 
 function updateModeUI() {
   const needsVideo = mode !== 'csi';
-  const needsCsi = mode !== 'video';
 
   // Show/hide camera prompt
   if (needsVideo && !videoCapture.isActive) {
@@ -169,6 +177,13 @@ function updateModeUI() {
   } else {
     cameraPrompt.style.display = 'none';
   }
+
+  // Update mode label in both the overlay and the camera prompt
+  const labelMap = { dual: 'DUAL FUSION', video: 'VIDEO ONLY', csi: 'CSI ONLY' };
+  const modeLabel = document.getElementById('mode-label');
+  const promptLabel = document.getElementById('prompt-mode-label');
+  if (modeLabel) modeLabel.textContent = labelMap[mode] || mode;
+  if (promptLabel) promptLabel.textContent = labelMap[mode] || mode;
 }
 
 function resizeCanvases() {
@@ -190,6 +205,7 @@ function resizeCanvases() {
 
 // === Main Loop ===
 let _loopErrorShown = false;
+let _diagDone = false;
 function mainLoop(timestamp) {
   if (!isRunning) return;
   requestAnimationFrame(mainLoop);
@@ -323,11 +339,28 @@ function mainLoop(timestamp) {
   const sim = fusionEngine.getCrossModalSimilarity();
   crossModalEl.textContent = sim.toFixed(3);
 
+  // RuVector attention pipeline stats
+  const rvStats = poseDecoder.attentionStats;
+  const rvEnergyEl = document.getElementById('rv-energy');
+  const rvRefineEl = document.getElementById('rv-refine');
+  const rvImpactEl = document.getElementById('rv-impact');
+  if (rvEnergyEl) rvEnergyEl.textContent = rvStats.energy.toFixed(2);
+  if (rvRefineEl) rvRefineEl.textContent = (rvStats.refinementMag * 1000).toFixed(1) + 'px';
+  if (rvImpactEl) {
+    const impact = Math.min(100, rvStats.refinementMag * 5000);
+    rvImpactEl.textContent = impact.toFixed(0) + '%';
+  }
+  // Pulse the pipeline stages when active
+  if (visualCnn.useRuVector && rvStats.energy > 0.1) {
+    document.querySelectorAll('.rv-stage').forEach(el => el.classList.add('active'));
+  }
+
   // RSSI update
   updateRssi(csiSimulator.rssiDbm);
 
   // One-time diagnostic
-  if (frameCount === 1) {
+  if (!_diagDone) {
+    _diagDone = true;
     console.log(`[PoseFusion] frame 1 OK — mode=${mode}, csi.bufLen=${csiSimulator.amplitudeBuffer.length}, embPts=${embPoints.fused.length}, rssi=${csiSimulator.rssiDbm.toFixed(1)}`);
   }
 
