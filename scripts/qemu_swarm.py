@@ -246,11 +246,18 @@ def provision_node(
     nvs_bin = build_dir / f"nvs_node{node.node_id}.bin"
     flash_image = build_dir / f"qemu_flash_node{node.node_id}.bin"
     base_image = build_dir / "qemu_flash_base.bin"
+    if not base_image.exists():
+        base_image = build_dir / "qemu_flash.bin"
 
     if not base_image.exists():
-        fatal(f"Base flash image not found: {base_image}")
+        fatal(f"Base flash image not found: {build_dir / 'qemu_flash_base.bin'} or {build_dir / 'qemu_flash.bin'}")
         fatal("Build the firmware first, or run without --skip-build.")
         sys.exit(EXIT_FATAL)
+
+    # Remove stale nvs_provision.bin to prevent race with prior node
+    stale = build_dir / "nvs_provision.bin"
+    if stale.exists():
+        stale.unlink()
 
     # Build provision.py arguments
     args = [
@@ -264,7 +271,7 @@ def provision_node(
         "--target-port", str(aggregator_port),
     ]
 
-    if node.channel:
+    if node.channel is not None:
         args.extend(["--channel", str(node.channel)])
 
     if node.edge_tier:
@@ -332,7 +339,7 @@ def setup_network(cfg: SwarmConfig, net: NetworkState) -> Dict[int, List[str]]:
     n = len(cfg.nodes)
 
     # Check if we can use TAP/bridge (requires root on Linux)
-    can_tap = IS_LINUX and os.geteuid() == 0
+    can_tap = IS_LINUX and hasattr(os, 'geteuid') and os.geteuid() == 0
 
     if not can_tap:
         if IS_LINUX:
@@ -345,7 +352,7 @@ def setup_network(cfg: SwarmConfig, net: NetworkState) -> Dict[int, List[str]]:
         for node in cfg.nodes:
             node_net_args[node.node_id] = [
                 "-nic", f"user,id=net{node.node_id},"
-                        f"hostfwd=udp::{cfg.aggregator_port + node.node_id}"
+                        f"hostfwd=udp::{cfg.aggregator_port + 100 + node.node_id}"
                         f"-:{cfg.aggregator_port}",
             ]
         return node_net_args
@@ -528,6 +535,10 @@ def run_assertions(
     and inline checks for swarm-specific assertions.
 
     Returns exit code: 0=PASS, 1=WARN, 2=FAIL, 3=FATAL.
+
+    NOTE: These inline assertions duplicate swarm_health.py. A future refactor
+    should delegate to swarm_health.run_assertions() to avoid divergence.
+    See ADR-062 architecture diagram.
     """
     n_nodes = len(cfg.nodes)
     worst = EXIT_PASS
@@ -648,38 +659,63 @@ def run_assertions(
         elif assert_name == "frame_rate_above":
             min_rate = int(assert_param) if assert_param else 10
             all_ok = True
+            nodes_with_data = 0
             for nid, log in logs.items():
                 m = re.search(r"frame[_ ]?rate[=: ]+([\d.]+)", log, re.IGNORECASE)
                 if m:
+                    nodes_with_data += 1
                     rate = float(m.group(1))
                     if rate < min_rate:
                         all_ok = False
-            _check(f"frame_rate_above({min_rate})",
-                    all_ok,
-                    f"All nodes >= {min_rate} Hz",
-                    f"Some nodes below {min_rate} Hz",
-                    EXIT_WARN)
+            if nodes_with_data == 0:
+                _check(f"frame_rate_above({min_rate})",
+                        False,
+                        "",
+                        "No parseable frame rate data found in any node log",
+                        EXIT_WARN)
+            else:
+                _check(f"frame_rate_above({min_rate})",
+                        all_ok,
+                        f"All nodes >= {min_rate} Hz",
+                        f"Some nodes below {min_rate} Hz",
+                        EXIT_WARN)
 
         elif assert_name == "max_boot_time_s":
             max_s = int(assert_param) if assert_param else 10
             all_ok = True
+            nodes_with_data = 0
             for nid, log in logs.items():
                 m = re.search(r"boot[_ ]?time[=: ]+([\d.]+)", log, re.IGNORECASE)
                 if m:
+                    nodes_with_data += 1
                     bt = float(m.group(1))
                     if bt > max_s:
                         all_ok = False
-            _check(f"max_boot_time_s({max_s})",
-                    all_ok,
-                    f"All nodes booted within {max_s}s",
-                    f"Some nodes exceeded {max_s}s boot time",
-                    EXIT_WARN)
+            if nodes_with_data == 0:
+                _check(f"max_boot_time_s({max_s})",
+                        False,
+                        "",
+                        "No parseable boot time data found in any node log",
+                        EXIT_WARN)
+            else:
+                _check(f"max_boot_time_s({max_s})",
+                        all_ok,
+                        f"All nodes booted within {max_s}s",
+                        f"Some nodes exceeded {max_s}s boot time",
+                        EXIT_WARN)
 
         elif assert_name == "no_heap_errors":
-            heap_pats = ["heap", "OOM", "out of memory", "heap corruption"]
+            heap_pats = [
+                r"HEAP_ERROR",
+                r"heap_caps_alloc.*failed",
+                r"out of memory",
+                r"heap corruption",
+                r"CORRUPT HEAP",
+                r"malloc.*fail",
+            ]
             found_in = [
                 nid for nid, log in logs.items()
-                if any(pat.lower() in log.lower() for pat in heap_pats)
+                if any(re.search(pat, log, re.IGNORECASE) for pat in heap_pats)
             ]
             _check("no_heap_errors",
                     len(found_in) == 0,
@@ -943,11 +979,12 @@ class SwarmOrchestrator:
             fatal(f"QEMU binary timed out: {self.qemu_bin}")
             sys.exit(EXIT_FATAL)
 
-        # Check base flash image
+        # Check base flash image (accept either name)
         base = self.build_dir / "qemu_flash_base.bin"
-        if not base.exists():
+        alt_base = self.build_dir / "qemu_flash.bin"
+        if not base.exists() and not alt_base.exists():
             if self.skip_build:
-                fatal(f"Base flash image not found: {base}")
+                fatal(f"Base flash image not found: {base} or {alt_base}")
                 fatal("Build the firmware first, or run without --skip-build.")
                 sys.exit(EXIT_FATAL)
             else:

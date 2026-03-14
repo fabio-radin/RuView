@@ -92,7 +92,7 @@ nodes:
     node_id: 1
     scenario: 2           # walking person
     channel: 6
-    tdm_slot: 1
+    tdm_slot: 1           # TDM slot index (auto-assigned from node position if omitted)
 
   - role: sensor
     node_id: 2
@@ -141,7 +141,7 @@ assertions:
 | `frame_rate_above` | Each node produces at least N frames/second |
 | `max_boot_time_s` | All nodes boot within N seconds |
 | `no_heap_errors` | No OOM or heap corruption in any log |
-| `network_partitioned_recovery` | After deliberate partition, nodes resume communication |
+| `network_partitioned_recovery` | After deliberate partition, nodes resume communication (future) |
 
 ### Preset Configurations
 

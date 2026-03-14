@@ -72,10 +72,12 @@ class NodeLog:
 # ---------------------------------------------------------------------------
 
 def load_logs(log_dir: Path, node_count: int) -> List[NodeLog]:
-    """Load node_0.log .. node_{n-1}.log from *log_dir*."""
+    """Load qemu_node{i}.log (or node_{i}.log fallback) from *log_dir*."""
     logs: List[NodeLog] = []
     for i in range(node_count):
-        path = log_dir / f"node_{i}.log"
+        path = log_dir / f"qemu_node{i}.log"
+        if not path.exists():
+            path = log_dir / f"node_{i}.log"
         if path.exists():
             text = path.read_text(encoding="utf-8", errors="replace")
         else:
@@ -85,9 +87,9 @@ def load_logs(log_dir: Path, node_count: int) -> List[NodeLog]:
 
 
 def _node_count_from_dir(log_dir: Path) -> int:
-    """Auto-detect node count by scanning for node_*.log files."""
+    """Auto-detect node count by scanning for qemu_node*.log (or node_*.log) files."""
     count = 0
-    while (log_dir / f"node_{count}.log").exists():
+    while (log_dir / f"qemu_node{count}.log").exists() or (log_dir / f"node_{count}.log").exists():
         count += 1
     return count
 
@@ -152,7 +154,7 @@ def assert_no_crashes(logs: List[NodeLog]) -> AssertionResult:
                 if re.search(pat, line):
                     crashed.append(f"node_{nl.node_id}: {line.strip()[:100]}")
                     break
-            if crashed and crashed[-1].startswith(f"node_{nl.node_id}"):
+            if crashed and crashed[-1].startswith(f"node_{nl.node_id}:"):
                 break  # one crash per node is enough
 
     if not crashed:
@@ -206,10 +208,21 @@ def assert_tdm_no_collision(logs: List[NodeLog]) -> AssertionResult:
     )
 
 
-def assert_all_nodes_produce_frames(logs: List[NodeLog]) -> AssertionResult:
-    """Each sensor node has CSI frame output."""
+def assert_all_nodes_produce_frames(
+    logs: List[NodeLog],
+    sensor_ids: Optional[List[int]] = None,
+) -> AssertionResult:
+    """Each sensor node has CSI frame output.
+
+    Args:
+        logs: Parsed node logs.
+        sensor_ids: If provided, only check these node IDs (skip coordinators).
+                    If None, check all nodes (legacy behavior).
+    """
     silent: List[int] = []
     for nl in logs:
+        if sensor_ids is not None and nl.node_id not in sensor_ids:
+            continue
         found = any(
             re.search(p, line, re.IGNORECASE)
             for line in nl.lines for p in _FRAME_PATTERNS
@@ -217,10 +230,11 @@ def assert_all_nodes_produce_frames(logs: List[NodeLog]) -> AssertionResult:
         if not found:
             silent.append(nl.node_id)
 
+    checked = len(sensor_ids) if sensor_ids is not None else len(logs)
     if not silent:
         return AssertionResult(
             name="all_nodes_produce_frames", passed=True,
-            message=f"All {len(logs)} nodes show frame activity",
+            message=f"All {checked} checked nodes show frame activity",
             severity=0,
         )
     return AssertionResult(
@@ -390,7 +404,7 @@ def assert_no_heap_errors(logs: List[NodeLog]) -> AssertionResult:
                 if re.search(pat, line, re.IGNORECASE):
                     errors.append(f"node_{nl.node_id}: {line.strip()[:100]}")
                     break
-            if errors and errors[-1].startswith(f"node_{nl.node_id}"):
+            if errors and errors[-1].startswith(f"node_{nl.node_id}:"):
                 break
 
     if not errors:
@@ -485,6 +499,10 @@ def run_assertions(
         elif name == "coordinator_receives_from_all":
             results.append(assert_coordinator_receives_from_all(
                 logs, coordinator_id=coordinator_id, sensor_ids=sensor_ids,
+            ))
+        elif name == "all_nodes_produce_frames":
+            results.append(assert_all_nodes_produce_frames(
+                logs, sensor_ids=sensor_ids, **kwargs,
             ))
         elif name in ASSERTION_REGISTRY:
             fn = ASSERTION_REGISTRY[name]
