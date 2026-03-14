@@ -964,23 +964,31 @@ This is useful when:
 **Install QEMU (one-time setup):**
 
 ```bash
-# Option 1: Build from source (recommended)
-git clone https://github.com/espressif/qemu.git
-cd qemu
-./configure --target-list=xtensa-softmmu
-make -j$(nproc)
-# Add to your PATH, or set QEMU_PATH later:
-export QEMU_PATH=/path/to/qemu/build/qemu-system-xtensa
+# Easiest: use the automated installer (installs QEMU + Python tools)
+bash scripts/install-qemu.sh
 
-# Option 2: On some Linux distros
-sudo apt install qemu-system-misc
+# Or check what's already installed:
+bash scripts/install-qemu.sh --check
 ```
 
-**Install Python tools:**
+The installer detects your OS (Ubuntu, Fedora, macOS, etc.), installs build dependencies, clones Espressif's QEMU fork, builds it, and adds it to your PATH. It also installs the Python tools (`esptool`, `pyyaml`, `esp-idf-nvs-partition-gen`).
+
+<details>
+<summary>Manual installation (if you prefer)</summary>
 
 ```bash
-pip install esptool esp-idf-nvs-partition-gen
+# Build from source
+git clone https://github.com/espressif/qemu.git
+cd qemu
+./configure --target-list=xtensa-softmmu --enable-slirp
+make -j$(nproc)
+export QEMU_PATH=$(pwd)/build/qemu-system-xtensa
+
+# Install Python tools
+pip install esptool pyyaml esp-idf-nvs-partition-gen
 ```
+
+</details>
 
 **For multi-node testing (optional):**
 
@@ -989,16 +997,35 @@ pip install esptool esp-idf-nvs-partition-gen
 sudo apt install socat bridge-utils iproute2
 ```
 
+### The `qemu-cli.sh` Command
+
+All QEMU testing is available through a single command:
+
+```bash
+bash scripts/qemu-cli.sh <command>
+```
+
+| Command | What it does |
+|---------|-------------|
+| `install` | Install QEMU (runs the installer above) |
+| `test` | Run single-node firmware test |
+| `swarm --preset smoke` | Quick 2-node swarm test |
+| `swarm --preset standard` | Standard 3-node test |
+| `mesh 3` | Multi-node mesh test |
+| `chaos` | Fault injection resilience test |
+| `fuzz --duration 60` | Run fuzz testing |
+| `status` | Show what's installed and ready |
+| `help` | Show all commands |
+
 ### Your First Test Run
 
 The simplest way to test the firmware:
 
 ```bash
-# This one command does everything:
-# 1. Builds the firmware with fake WiFi data
-# 2. Creates a virtual flash drive
-# 3. Boots it in the emulator
-# 4. Checks the output for errors
+# Using the CLI:
+bash scripts/qemu-cli.sh test
+
+# Or directly:
 bash scripts/qemu-esp32s3-test.sh
 ```
 
