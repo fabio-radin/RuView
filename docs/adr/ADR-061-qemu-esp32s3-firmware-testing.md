@@ -2,8 +2,8 @@
 
 | Field       | Value                                          |
 |-------------|------------------------------------------------|
-| **Status**  | Proposed                                       |
-| **Date**    | 2026-03-13                                     |
+| **Status**  | Accepted                                       |
+| **Date**    | 2026-03-13 (updated 2026-03-14)                |
 | **Authors** | RuView Team                                    |
 | **Relates** | ADR-018 (binary frame), ADR-039 (edge intel), ADR-040 (WASM), ADR-057 (build guard), ADR-060 (channel/MAC filter) |
 
@@ -862,3 +862,32 @@ Alternative to QEMU with better peripheral modeling for some platforms.
 - ADR-040: WASM programmable sensing runtime
 - ADR-057: Build-time CSI guard (`CONFIG_ESP_WIFI_CSI_ENABLED`)
 - ADR-060: Channel override and MAC address filter
+
+---
+
+## Optimization Log (2026-03-14)
+
+### Bugs Fixed
+
+1. **LFSR float bias** — `lfsr_float()` used divisor 32767.5 producing range [-1.0, 1.00002]; fixed to 32768.0 for exact [-1.0, +1.0)
+2. **MAC filter initialization** — `gen_mac_filter()` compared `frame_count == scenario_start_ms` (count vs timestamp); replaced with boolean flag
+3. **Scenario infinite loop** — `advance_scenario()` looped to scenario 0 when all completed; now sets `s_all_done=true` and timer callback exits early
+4. **Boot check severity** — `validate_qemu_output.py` reported no-boot as ERROR; upgraded to FATAL (nothing works without boot)
+5. **NVS boundary configs** — `boundary-max` used `vital_win=65535` which firmware silently rejects (valid: 32-256); fixed to 256
+6. **NVS boundary-min** — `vital_win=1` also invalid; fixed to 32 (firmware min)
+7. **edge-tier2-custom** — `vital_win=512` exceeded firmware max of 256; fixed to 256
+8. **power-save config** — Described as "10% duty cycle" but didn't set `power_duty=10`; fixed
+9. **wasm-signed/unsigned** — Both configs were identical; signed now includes pubkey blob, unsigned sets `wasm_verify=0`
+
+### Optimizations Applied
+
+1. **SLIRP networking** — QEMU runner now passes `-nic user,model=open_eth` for UDP testing
+2. **Scenario completion tracking** — Validator now checks `All N scenarios complete` log marker (check 15)
+3. **Frame rate monitoring** — Validator extracts `scenario=N frames=M` counters for rate analysis (check 16)
+4. **Watchdog tuning** — `sdkconfig.qemu` relaxes WDT to 30s / INT_WDT to 800ms for QEMU timing variance
+5. **Timer stack depth** — Increased `FREERTOS_TIMER_TASK_STACK_DEPTH=4096` to prevent overflow from math-heavy mock callback
+6. **Display disabled** — `CONFIG_DISPLAY_ENABLE=n` in QEMU overlay (no I2C hardware)
+7. **CI fuzz job** — Added `fuzz-test` job running all 3 fuzz targets for 60s each with crash artifact upload
+8. **CI NVS validation** — Added `nvs-matrix-validate` job that generates all 14 binaries and verifies sizes
+9. **CI matrix expanded** — Added `edge-tier1`, `boundary-max`, `boundary-min` to QEMU test matrix (4 → 7 configs)
+10. **QEMU cache key** — Uses `github.run_id` with restore-keys fallback to prevent stale QEMU builds

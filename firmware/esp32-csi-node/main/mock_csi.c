@@ -121,8 +121,8 @@ static uint32_t lfsr_next(void)
 static float lfsr_float(void)
 {
     uint32_t r = lfsr_next();
-    /* Map [0, UINT32_MAX] to [-1.0, +1.0] */
-    return ((float)(r & 0xFFFF) / 32767.5f) - 1.0f;
+    /* Map [0, 65535] to [-1.0, +1.0] using 65535/2 = 32767.5 */
+    return ((float)(r & 0xFFFF) / 32768.0f) - 1.0f;
 }
 
 /* ---- Module state ---- */
@@ -402,11 +402,12 @@ static void gen_channel_sweep(uint8_t *iq_buf, uint8_t *channel, int8_t *rssi)
 static void gen_mac_filter(uint8_t *iq_buf, uint8_t *channel, int8_t *rssi,
                            bool *skip_inject)
 {
-    /* Set up the filter MAC to match s_good_mac on first frame. */
-    if (s_state.frame_count == 0 ||
-        (s_state.frame_count == s_state.scenario_start_ms)) {
+    /* Set up the filter MAC to match s_good_mac on first frame of this scenario. */
+    static bool s_mac_filter_initialized = false;
+    if (!s_mac_filter_initialized) {
         memcpy(g_nvs_config.filter_mac, s_good_mac, 6);
         g_nvs_config.filter_mac_set = 1;
+        s_mac_filter_initialized = true;
         ESP_LOGI(TAG, "MAC filter scenario: filter set to %02X:%02X:%02X:%02X:%02X:%02X",
                  s_good_mac[0], s_good_mac[1], s_good_mac[2],
                  s_good_mac[3], s_good_mac[4], s_good_mac[5]);
@@ -477,13 +478,17 @@ static void gen_boundary_rssi(uint8_t *iq_buf, uint8_t *channel, int8_t *rssi)
 /**
  * Advance to the next scenario when running SCENARIO_ALL.
  */
+/** Flag: set when all scenarios are done so timer callback exits early. */
+static bool s_all_done = false;
+
 static void advance_scenario(void)
 {
     s_state.all_idx++;
     if (s_state.all_idx >= MOCK_SCENARIO_COUNT) {
         ESP_LOGI(TAG, "All %d scenarios complete (%lu total frames)",
                  MOCK_SCENARIO_COUNT, (unsigned long)s_state.frame_count);
-        s_state.all_idx = 0;  /* Loop. */
+        s_all_done = true;
+        return;  /* Stop generating — timer callback will check s_all_done. */
     }
 
     s_state.scenario = s_state.all_idx;
@@ -506,6 +511,11 @@ static void advance_scenario(void)
 static void mock_timer_cb(void *arg)
 {
     (void)arg;
+
+    /* All scenarios finished — stop generating. */
+    if (s_all_done) {
+        return;
+    }
 
     /* Check for scenario timeout in SCENARIO_ALL mode. */
     if (s_state.scenario == MOCK_SCENARIO_ALL ||
@@ -610,6 +620,7 @@ esp_err_t mock_csi_init(uint8_t scenario)
     s_state.person2_x = 4.0f;
     s_state.person2_speed = WALK_SPEED_MS * 0.6f;
     s_state.scenario_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_all_done = false;
 
     /* Reset LFSR to deterministic seed. */
     s_lfsr = 0xDEADBEEF;

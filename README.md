@@ -1697,31 +1697,47 @@ WebSocket: `ws://localhost:3001/ws/sensing` (real-time sensing + vital signs)
 </details>
 
 <details>
-<summary><strong>QEMU Firmware Testing (ADR-061)</strong></summary>
+<summary><strong>QEMU Firmware Testing (ADR-061) — 9-Layer Platform</strong></summary>
 
-Test ESP32-S3 firmware without physical hardware using Espressif's QEMU fork.
+Test ESP32-S3 firmware without physical hardware using Espressif's QEMU fork. The platform provides 9 layers of testing capability:
+
+| Layer | Capability | Script / Config |
+|-------|-----------|-----------------|
+| 1 | Mock CSI generator (10 physics-based scenarios) | `firmware/esp32-csi-node/main/mock_csi.c` |
+| 2 | Single-node QEMU runner + UART validation (16 checks) | `scripts/qemu-esp32s3-test.sh`, `scripts/validate_qemu_output.py` |
+| 3 | Multi-node TDM mesh simulation (TAP networking) | `scripts/qemu-mesh-test.sh`, `scripts/validate_mesh_test.py` |
+| 4 | GDB remote debugging (VS Code integration) | `.vscode/launch.json` |
+| 5 | Code coverage (gcov/lcov via apptrace) | `firmware/esp32-csi-node/sdkconfig.coverage` |
+| 6 | Fuzz testing (libFuzzer + ASAN/UBSAN) | `firmware/esp32-csi-node/test/fuzz_*.c` |
+| 7 | NVS provisioning matrix (14 configs) | `scripts/generate_nvs_matrix.py` |
+| 8 | Snapshot regression (sub-second VM restore) | `scripts/qemu-snapshot-test.sh` |
+| 9 | Chaos testing (fault injection + health monitoring) | `scripts/qemu-chaos-test.sh`, `scripts/inject_fault.py`, `scripts/check_health.py` |
 
 ```bash
-# Build with mock CSI
+# Quick start: build + run + validate
 cd firmware/esp32-csi-node
 idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.qemu" build
 
-# Create flash image
-esptool.py --chip esp32s3 merge_bin -o build/qemu_flash.bin \
-  --flash_size 8MB 0x0 build/bootloader/bootloader.bin \
-  0x8000 build/partition_table/partition-table.bin \
-  0x20000 build/esp32-csi-node.bin
+# Single-node test (builds, merges flash, runs QEMU, validates output)
+bash scripts/qemu-esp32s3-test.sh
 
-# Run in QEMU
-qemu-system-xtensa -machine esp32s3 -nographic \
-  -drive file=build/qemu_flash.bin,if=mtd,format=raw
+# Multi-node mesh test (3 QEMU instances with TDM)
+sudo bash scripts/qemu-mesh-test.sh 3
+
+# Fuzz testing (60 seconds per target)
+cd firmware/esp32-csi-node/test && make all CC=clang && make run_serialize FUZZ_DURATION=60
+
+# Chaos testing (fault injection resilience)
+bash scripts/qemu-chaos-test.sh --faults all --duration 120
 ```
 
 **10 test scenarios**: empty room, static person, walking, fall, multi-person, channel sweep, MAC filter, ring overflow, boundary RSSI, zero-length frames.
 
-**14 NVS configs**: default, WiFi-only, full ADR-060, edge tiers 0/1/2, TDM mesh, WASM signed/unsigned, 5GHz, boundary values.
+**14 NVS configs**: default, WiFi-only, full ADR-060, edge tiers 0/1/2, TDM mesh, WASM signed/unsigned, 5GHz, boundary max/min, power-save, empty-strings.
 
-See [ADR-061](docs/adr/ADR-061-qemu-esp32s3-firmware-testing.md) and [firmware README](firmware/esp32-csi-node/README.md) for full details.
+**CI**: GitHub Actions workflow runs 7 NVS matrix configs, 3 fuzz targets, and NVS binary validation on every push to `firmware/`.
+
+See [ADR-061](docs/adr/ADR-061-qemu-esp32s3-firmware-testing.md) for the full architecture.
 
 </details>
 

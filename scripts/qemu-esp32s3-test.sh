@@ -111,21 +111,26 @@ if ! command -v timeout &>/dev/null; then
 fi
 
 QEMU_EXIT=0
+
+# Common QEMU arguments
+QEMU_ARGS=(
+    -machine esp32s3
+    -nographic
+    -drive "file=$FLASH_IMAGE,if=mtd,format=raw"
+    -serial mon:stdio
+    -no-reboot
+)
+
+# Enable SLIRP user-mode networking for UDP if available
+if [ "${QEMU_NET:-1}" != "0" ]; then
+    QEMU_ARGS+=(-nic "user,model=open_eth,net=10.0.2.0/24,host=10.0.2.2")
+fi
+
 if [ -n "$TIMEOUT_CMD" ]; then
-    $TIMEOUT_CMD "$TIMEOUT_SEC" "$QEMU_BIN" \
-        -machine esp32s3 \
-        -nographic \
-        -drive file="$FLASH_IMAGE",if=mtd,format=raw \
-        -serial mon:stdio \
-        -no-reboot \
+    $TIMEOUT_CMD "$TIMEOUT_SEC" "$QEMU_BIN" "${QEMU_ARGS[@]}" \
         2>&1 | tee "$LOG_FILE" || QEMU_EXIT=$?
 else
-    "$QEMU_BIN" \
-        -machine esp32s3 \
-        -nographic \
-        -drive file="$FLASH_IMAGE",if=mtd,format=raw \
-        -serial mon:stdio \
-        -no-reboot \
+    "$QEMU_BIN" "${QEMU_ARGS[@]}" \
         2>&1 | tee "$LOG_FILE" || QEMU_EXIT=$?
 fi
 

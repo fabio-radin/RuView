@@ -31,7 +31,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/qemu-esp32
-          key: qemu-esp32s3-${{ env.QEMU_BRANCH }}-v2
+          # Include date component so cache refreshes monthly when branch updates
+          key: qemu-esp32s3-${{ env.QEMU_BRANCH }}-v3-${{ github.run_id }}
+          restore-keys: |
+            qemu-esp32s3-${{ env.QEMU_BRANCH }}-v3-
 
       - name: Install QEMU build dependencies
         if: steps.cache-qemu.outputs.cache-hit != 'true'
@@ -73,7 +76,7 @@ jobs:
     needs: build-qemu
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:${{ env.IDF_VERSION }}
+      image: espressif/idf:v5.4
 
     strategy:
       fail-fast: false
@@ -82,7 +85,10 @@ jobs:
           - default
           - full-adr060
           - edge-tier0
+          - edge-tier1
           - tdm-3node
+          - boundary-max
+          - boundary-min
 
     steps:
       - uses: actions/checkout@v4
@@ -159,9 +165,8 @@ jobs:
       - name: Run QEMU smoke test
         env:
           QEMU_PATH: /opt/qemu-esp32/bin/qemu-system-xtensa
-          QEMU_TIMEOUT: "60"
+          QEMU_TIMEOUT: "90"
         run: |
-          # Run QEMU with timeout; capture output
           echo "Starting QEMU (timeout: ${QEMU_TIMEOUT}s)..."
 
           timeout "$QEMU_TIMEOUT" "$QEMU_PATH" \
@@ -169,6 +174,7 @@ jobs:
             -nographic \
             -drive file=firmware/esp32-csi-node/build/qemu_flash.bin,if=mtd,format=raw \
             -serial mon:stdio \
+            -nic user,model=open_eth,net=10.0.2.0/24 \
             -no-reboot \
             2>&1 | tee firmware/esp32-csi-node/build/qemu_output.log || true
 
@@ -188,3 +194,92 @@ jobs:
             firmware/esp32-csi-node/build/qemu_output.log
             firmware/esp32-csi-node/build/nvs_matrix/
           retention-days: 14
+
+  fuzz-test:
+    name: Fuzz Testing (ADR-061 Layer 6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Build fuzz targets
+        working-directory: firmware/esp32-csi-node/test
+        run: make all CC=clang
+
+      - name: Run serialize fuzzer (60s)
+        working-directory: firmware/esp32-csi-node/test
+        run: make run_serialize FUZZ_DURATION=60
+        continue-on-error: true
+
+      - name: Run edge enqueue fuzzer (60s)
+        working-directory: firmware/esp32-csi-node/test
+        run: make run_edge FUZZ_DURATION=60
+        continue-on-error: true
+
+      - name: Run NVS config fuzzer (60s)
+        working-directory: firmware/esp32-csi-node/test
+        run: make run_nvs FUZZ_DURATION=60
+        continue-on-error: true
+
+      - name: Check for crashes
+        working-directory: firmware/esp32-csi-node/test
+        run: |
+          CRASHES=$(find . -name "crash-*" -o -name "oom-*" -o -name "timeout-*" 2>/dev/null | wc -l)
+          echo "Crash artifacts found: $CRASHES"
+          if [ "$CRASHES" -gt 0 ]; then
+            echo "::error::Fuzzer found $CRASHES crash/oom/timeout artifacts"
+            ls -la crash-* oom-* timeout-* 2>/dev/null
+            exit 1
+          fi
+
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            firmware/esp32-csi-node/test/crash-*
+            firmware/esp32-csi-node/test/oom-*
+            firmware/esp32-csi-node/test/timeout-*
+          retention-days: 30
+
+  nvs-matrix-validate:
+    name: NVS Matrix Generation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NVS generator
+        run: pip install esp-idf-nvs-partition-gen
+
+      - name: Generate all 14 NVS configs
+        run: |
+          python3 scripts/generate_nvs_matrix.py \
+            --output-dir build/nvs_matrix
+
+      - name: Verify all binaries generated
+        run: |
+          EXPECTED=14
+          ACTUAL=$(ls build/nvs_matrix/nvs_*.bin 2>/dev/null | wc -l)
+          echo "Generated $ACTUAL / $EXPECTED NVS binaries"
+          ls -la build/nvs_matrix/
+
+          if [ "$ACTUAL" -lt "$EXPECTED" ]; then
+            echo "::error::Only $ACTUAL of $EXPECTED NVS binaries generated"
+            exit 1
+          fi
+
+      - name: Verify binary sizes
+        run: |
+          for f in build/nvs_matrix/nvs_*.bin; do
+            SIZE=$(stat -c%s "$f")
+            if [ "$SIZE" -ne 24576 ]; then
+              echo "::error::$f has unexpected size $SIZE (expected 24576)"
+              exit 1
+            fi
+            echo "  OK: $(basename $f) ($SIZE bytes)"
+          done

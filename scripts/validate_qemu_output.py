@@ -131,7 +131,7 @@ def validate_log(log_text: str) -> ValidationReport:
     if boot_found:
         report.add("Boot", Severity.PASS, "Firmware booted successfully")
     else:
-        report.add("Boot", Severity.ERROR, "No boot indicator found (app_main / main_task)")
+        report.add("Boot", Severity.FATAL, "No boot indicator found (app_main / main_task)")
 
     # ---- Check 2: NVS load ----
     nvs_patterns = [r"nvs_config:", r"nvs_config_load", r"NVS", r"csi_cfg"]
@@ -326,6 +326,39 @@ def validate_log(log_text: str) -> ValidationReport:
     else:
         report.add("Clean exit", Severity.WARN,
                     "Reboot detected (may indicate crash or watchdog)")
+
+    # ---- Check 15: Scenario completion (when running all scenarios) ----
+    all_scenarios_pattern = r"All (\d+) scenarios complete"
+    scenario_match = re.search(all_scenarios_pattern, log_text)
+    if scenario_match:
+        n_scenarios = int(scenario_match.group(1))
+        report.add("Scenario completion", Severity.PASS,
+                    f"All {n_scenarios} scenarios completed", count=n_scenarios)
+    else:
+        # Check if individual scenario started indicators exist
+        scenario_starts = re.findall(r"=== Scenario (\d+) started ===", log_text)
+        if scenario_starts:
+            report.add("Scenario completion", Severity.WARN,
+                        f"Started {len(scenario_starts)} scenarios but no completion marker",
+                        count=len(scenario_starts))
+        else:
+            report.add("Scenario completion", Severity.SKIP,
+                        "No scenario tracking (single scenario or mock not enabled)")
+
+    # ---- Check 16: Frame rate sanity ----
+    # Extract scenario frame counts and check they're reasonable
+    frame_reports = re.findall(r"scenario=\d+ frames=(\d+)", log_text)
+    if frame_reports:
+        max_frames = max(int(f) for f in frame_reports)
+        if max_frames > 0:
+            report.add("Frame rate", Severity.PASS,
+                        f"Peak frame counter: {max_frames}", count=max_frames)
+        else:
+            report.add("Frame rate", Severity.ERROR,
+                        "Frame counters are all zero")
+    else:
+        report.add("Frame rate", Severity.SKIP,
+                    "No periodic frame reports found")
 
     return report
 

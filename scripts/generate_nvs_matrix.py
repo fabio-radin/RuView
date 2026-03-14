@@ -131,7 +131,7 @@ def define_configs() -> List[NvsConfig]:
             NvsEntry("edge_tier", "data", "u8", "2"),
             NvsEntry("pres_thresh", "data", "u16", "100"),
             NvsEntry("fall_thresh", "data", "u16", "3000"),
-            NvsEntry("vital_win", "data", "u16", "512"),
+            NvsEntry("vital_win", "data", "u16", "256"),
             NvsEntry("vital_int", "data", "u16", "500"),
             NvsEntry("subk_count", "data", "u8", "16"),
         ],
@@ -160,6 +160,10 @@ def define_configs() -> List[NvsConfig]:
             NvsEntry("password", "data", "string", "testpass123"),
             NvsEntry("target_ip", "data", "string", "10.0.2.2"),
             NvsEntry("edge_tier", "data", "u8", "2"),
+            # wasm_verify=1 + a 32-byte dummy Ed25519 pubkey
+            NvsEntry("wasm_verify", "data", "u8", "1"),
+            NvsEntry("wasm_pubkey", "data", "hex2bin",
+                     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
         ],
     ))
 
@@ -172,6 +176,8 @@ def define_configs() -> List[NvsConfig]:
             NvsEntry("password", "data", "string", "testpass123"),
             NvsEntry("target_ip", "data", "string", "10.0.2.2"),
             NvsEntry("edge_tier", "data", "u8", "2"),
+            NvsEntry("wasm_verify", "data", "u8", "0"),
+            NvsEntry("wasm_max", "data", "u8", "2"),
         ],
     ))
 
@@ -187,10 +193,12 @@ def define_configs() -> List[NvsConfig]:
         ],
     ))
 
-    # 11. boundary-max - maximum values for all numeric fields
+    # 11. boundary-max - maximum VALID values for all numeric fields
+    # Uses firmware-validated max ranges (not raw u8/u16 max):
+    #   vital_win: 32-256, top_k: 1-32, power_duty: 10-100
     configs.append(NvsConfig(
         name="boundary-max",
-        description="Boundary test: maximum values for all numeric NVS fields",
+        description="Boundary test: maximum valid values per firmware validation ranges",
         entries=[
             NvsEntry("ssid", "data", "string", "TestNetwork"),
             NvsEntry("password", "data", "string", "testpass123"),
@@ -200,16 +208,17 @@ def define_configs() -> List[NvsConfig]:
             NvsEntry("edge_tier", "data", "u8", "2"),
             NvsEntry("pres_thresh", "data", "u16", "65535"),
             NvsEntry("fall_thresh", "data", "u16", "65535"),
-            NvsEntry("vital_win", "data", "u16", "65535"),
+            NvsEntry("vital_win", "data", "u16", "256"),     # max validated
             NvsEntry("vital_int", "data", "u16", "10000"),
             NvsEntry("subk_count", "data", "u8", "32"),
+            NvsEntry("power_duty", "data", "u8", "100"),
         ],
     ))
 
-    # 12. boundary-min - minimum values for all numeric fields
+    # 12. boundary-min - minimum VALID values for all numeric fields
     configs.append(NvsConfig(
         name="boundary-min",
-        description="Boundary test: minimum values for all numeric NVS fields",
+        description="Boundary test: minimum valid values per firmware validation ranges",
         entries=[
             NvsEntry("ssid", "data", "string", "TestNetwork"),
             NvsEntry("password", "data", "string", "testpass123"),
@@ -218,10 +227,11 @@ def define_configs() -> List[NvsConfig]:
             NvsEntry("node_id", "data", "u8", "0"),
             NvsEntry("edge_tier", "data", "u8", "0"),
             NvsEntry("pres_thresh", "data", "u16", "1"),
-            NvsEntry("fall_thresh", "data", "u16", "1"),
-            NvsEntry("vital_win", "data", "u16", "1"),
+            NvsEntry("fall_thresh", "data", "u16", "100"),    # min valid (0.1 rad/s²)
+            NvsEntry("vital_win", "data", "u16", "32"),       # min validated
             NvsEntry("vital_int", "data", "u16", "100"),
             NvsEntry("subk_count", "data", "u8", "1"),
+            NvsEntry("power_duty", "data", "u8", "10"),
         ],
     ))
 
@@ -234,6 +244,7 @@ def define_configs() -> List[NvsConfig]:
             NvsEntry("password", "data", "string", "testpass123"),
             NvsEntry("target_ip", "data", "string", "10.0.2.2"),
             NvsEntry("edge_tier", "data", "u8", "1"),
+            NvsEntry("power_duty", "data", "u8", "10"),
         ],
     ))
 
