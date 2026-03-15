@@ -6,22 +6,23 @@
  * Under QEMU (CONFIG_CSI_MOCK_ENABLED), uses a mock generator
  * that produces synthetic vital signs for pipeline testing.
  *
- * MR60BHA2 frame format (Seeed proprietary):
- *   Header:  0x53 0x59 (2 bytes)
- *   Control: type_h type_l (2 bytes)
- *   Length:  len_h len_l (2 bytes, big-endian)
- *   Data:    [length bytes]
- *   Footer:  0x54 0x43 (2 bytes)
+ * MR60BHA2 frame format (Seeed mmWave protocol):
+ *   [0]    SOF = 0x01
+ *   [1-2]  Frame ID (uint16, big-endian)
+ *   [3-4]  Data Length (uint16, big-endian)
+ *   [5-6]  Frame Type (uint16, big-endian)
+ *   [7]    Header Checksum = ~XOR(bytes 0..6)
+ *   [8..N] Payload (N = data_length)
+ *   [N+1]  Data Checksum = ~XOR(payload bytes)
  *
- *   Type 0x01 0x01 = Breathing data
- *   Type 0x02 0x01 = Heart rate data
- *   Type 0x80 0x01 = Presence/distance
+ *   Frame types: 0x0A14=breathing, 0x0A15=heart rate,
+ *                0x0A16=distance, 0x0F09=presence
  *
- * LD2410 frame format (HLK binary):
- *   Header:  0xF4 0xF3 0xF2 0xF1 (4 bytes)
- *   Length:  len_l len_h (2 bytes, little-endian)
- *   Data:    [length bytes, includes type byte]
- *   Footer:  0xF8 0xF7 0xF6 0xF5 (4 bytes)
+ * LD2410 frame format (HLK binary, 256000 baud):
+ *   Header:  0xF4 0xF3 0xF2 0xF1
+ *   Length:  uint16 LE
+ *   Data:    [type 0xAA] [target_state] [moving_dist LE] [energy] ...
+ *   Footer:  0xF8 0xF7 0xF6 0xF5
  */
 
 #include "mmwave_sensor.h"
@@ -41,52 +42,60 @@
 static const char *TAG = "mmwave";
 
 /* ---- Configuration ---- */
-#define MMWAVE_UART_NUM       UART_NUM_1
-#define MMWAVE_UART_BAUD      115200
-#define MMWAVE_BUF_SIZE       256
-#define MMWAVE_TASK_STACK     4096
-#define MMWAVE_TASK_PRIORITY  3
-#define MMWAVE_PROBE_TIMEOUT_MS 2000
+#define MMWAVE_UART_NUM           UART_NUM_1
+#define MMWAVE_MR60_BAUD          115200
+#define MMWAVE_LD2410_BAUD        256000
+#define MMWAVE_BUF_SIZE           256
+#define MMWAVE_TASK_STACK         4096
+#define MMWAVE_TASK_PRIORITY      3
+#define MMWAVE_PROBE_TIMEOUT_MS   2000
+#define MMWAVE_MR60_MAX_PAYLOAD   30   /* Sanity limit from Arduino lib */
 
-/* ---- MR60BHA2 protocol constants ---- */
-#define MR60_HEADER_H  0x53
-#define MR60_HEADER_L  0x59
-#define MR60_FOOTER_H  0x54
-#define MR60_FOOTER_L  0x43
+/* ---- MR60BHA2 protocol constants (Seeed mmWave) ---- */
+#define MR60_SOF            0x01
 
-/* MR60BHA2 message types (type_h << 8 | type_l) */
-#define MR60_TYPE_BREATHING   0x0101
-#define MR60_TYPE_HEARTRATE   0x0201
-#define MR60_TYPE_PRESENCE    0x8001
+/* Frame types (big-endian uint16 at offset 5-6) */
+#define MR60_TYPE_BREATHING     0x0A14
+#define MR60_TYPE_HEARTRATE     0x0A15
+#define MR60_TYPE_DISTANCE      0x0A16
+#define MR60_TYPE_PRESENCE      0x0F09
+#define MR60_TYPE_PHASE         0x0A13
+#define MR60_TYPE_POINTCLOUD    0x0A04
 
 /* ---- LD2410 protocol constants ---- */
-#define LD2410_HEADER  { 0xF4, 0xF3, 0xF2, 0xF1 }
-#define LD2410_FOOTER  { 0xF8, 0xF7, 0xF6, 0xF5 }
+#define LD2410_REPORT_HEAD  0xAA
+#define LD2410_REPORT_TAIL  0x55
 
 /* ---- Shared state ---- */
 static mmwave_state_t s_state;
 static volatile bool s_running;
 
 /* ======================================================================
- * MR60BHA2 Parser
+ * MR60BHA2 Parser (corrected protocol from Seeed Arduino library)
  * ====================================================================== */
 
+static uint8_t mr60_calc_checksum(const uint8_t *data, uint16_t len)
+{
+    uint8_t cksum = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        cksum ^= data[i];
+    }
+    return ~cksum;
+}
+
 typedef enum {
-    MR60_WAIT_HEADER_H,
-    MR60_WAIT_HEADER_L,
-    MR60_READ_TYPE_H,
-    MR60_READ_TYPE_L,
-    MR60_READ_LEN_H,
-    MR60_READ_LEN_L,
+    MR60_WAIT_SOF,
+    MR60_READ_HEADER,   /* Accumulate bytes 1..7 (frame_id, len, type, hdr_cksum) */
     MR60_READ_DATA,
-    MR60_WAIT_FOOTER_H,
-    MR60_WAIT_FOOTER_L,
+    MR60_READ_DATA_CKSUM,
 } mr60_parse_state_t;
 
 typedef struct {
     mr60_parse_state_t state;
-    uint8_t  type_h, type_l;
+    uint8_t  header[8];     /* Full header: SOF + frame_id(2) + len(2) + type(2) + hdr_cksum */
+    uint8_t  hdr_idx;
     uint16_t data_len;
+    uint16_t frame_type;
     uint16_t data_idx;
     uint8_t  data[MMWAVE_BUF_SIZE];
 } mr60_parser_t;
@@ -101,7 +110,7 @@ static void mr60_process_frame(uint16_t type, const uint8_t *data, uint16_t len)
     switch (type) {
     case MR60_TYPE_BREATHING:
         if (len >= 4) {
-            /* Breathing rate as float32 (little-endian). */
+            /* Breathing rate as float32 (little-endian in payload). */
             float br;
             memcpy(&br, data, sizeof(float));
             if (br >= 0.0f && br <= 60.0f) {
@@ -120,19 +129,26 @@ static void mr60_process_frame(uint16_t type, const uint8_t *data, uint16_t len)
         }
         break;
 
-    case MR60_TYPE_PRESENCE:
-        if (len >= 1) {
-            s_state.person_present = (data[0] != 0);
-            if (len >= 5) {
+    case MR60_TYPE_DISTANCE:
+        if (len >= 8) {
+            /* Bytes 0-3: range flag (uint32 LE). 0 = no valid distance. */
+            uint32_t range_flag;
+            memcpy(&range_flag, data, sizeof(uint32_t));
+            if (range_flag != 0 && len >= 8) {
                 float dist;
-                memcpy(&dist, &data[1], sizeof(float));
+                memcpy(&dist, &data[4], sizeof(float));
                 s_state.distance_cm = dist;
             }
         }
         break;
 
+    case MR60_TYPE_PRESENCE:
+        if (len >= 1) {
+            s_state.person_present = (data[0] != 0);
+        }
+        break;
+
     default:
-        /* Unknown frame type — ignore. */
         break;
     }
 }
@@ -140,65 +156,67 @@ static void mr60_process_frame(uint16_t type, const uint8_t *data, uint16_t len)
 static void mr60_feed_byte(uint8_t b)
 {
     switch (s_mr60.state) {
-    case MR60_WAIT_HEADER_H:
-        if (b == MR60_HEADER_H) s_mr60.state = MR60_WAIT_HEADER_L;
-        break;
-    case MR60_WAIT_HEADER_L:
-        if (b == MR60_HEADER_L) s_mr60.state = MR60_READ_TYPE_H;
-        else s_mr60.state = MR60_WAIT_HEADER_H;
-        break;
-    case MR60_READ_TYPE_H:
-        s_mr60.type_h = b;
-        s_mr60.state = MR60_READ_TYPE_L;
-        break;
-    case MR60_READ_TYPE_L:
-        s_mr60.type_l = b;
-        s_mr60.state = MR60_READ_LEN_H;
-        break;
-    case MR60_READ_LEN_H:
-        s_mr60.data_len = (uint16_t)b << 8;
-        s_mr60.state = MR60_READ_LEN_L;
-        break;
-    case MR60_READ_LEN_L:
-        s_mr60.data_len |= b;
-        s_mr60.data_idx = 0;
-        if (s_mr60.data_len == 0) {
-            s_mr60.state = MR60_WAIT_FOOTER_H;
-        } else if (s_mr60.data_len > MMWAVE_BUF_SIZE) {
-            s_state.error_count++;
-            s_mr60.state = MR60_WAIT_HEADER_H;
-        } else {
-            s_mr60.state = MR60_READ_DATA;
+    case MR60_WAIT_SOF:
+        if (b == MR60_SOF) {
+            s_mr60.header[0] = b;
+            s_mr60.hdr_idx = 1;
+            s_mr60.state = MR60_READ_HEADER;
         }
         break;
+
+    case MR60_READ_HEADER:
+        s_mr60.header[s_mr60.hdr_idx++] = b;
+        if (s_mr60.hdr_idx >= 8) {
+            /* Validate header checksum: ~XOR(bytes 0..6) == byte 7 */
+            uint8_t expected = mr60_calc_checksum(s_mr60.header, 7);
+            if (expected != s_mr60.header[7]) {
+                s_state.error_count++;
+                s_mr60.state = MR60_WAIT_SOF;
+                break;
+            }
+            /* Parse header fields (big-endian) */
+            s_mr60.data_len = ((uint16_t)s_mr60.header[3] << 8) | s_mr60.header[4];
+            s_mr60.frame_type = ((uint16_t)s_mr60.header[5] << 8) | s_mr60.header[6];
+            s_mr60.data_idx = 0;
+
+            if (s_mr60.data_len > MMWAVE_MR60_MAX_PAYLOAD) {
+                s_state.error_count++;
+                s_mr60.state = MR60_WAIT_SOF;
+            } else if (s_mr60.data_len == 0) {
+                s_mr60.state = MR60_READ_DATA_CKSUM;
+            } else {
+                s_mr60.state = MR60_READ_DATA;
+            }
+        }
+        break;
+
     case MR60_READ_DATA:
         s_mr60.data[s_mr60.data_idx++] = b;
         if (s_mr60.data_idx >= s_mr60.data_len) {
-            s_mr60.state = MR60_WAIT_FOOTER_H;
+            s_mr60.state = MR60_READ_DATA_CKSUM;
         }
         break;
-    case MR60_WAIT_FOOTER_H:
-        if (b == MR60_FOOTER_H) {
-            s_mr60.state = MR60_WAIT_FOOTER_L;
+
+    case MR60_READ_DATA_CKSUM:
+        /* Validate data checksum */
+        if (s_mr60.data_len > 0) {
+            uint8_t expected = mr60_calc_checksum(s_mr60.data, s_mr60.data_len);
+            if (expected == b) {
+                mr60_process_frame(s_mr60.frame_type, s_mr60.data, s_mr60.data_len);
+            } else {
+                s_state.error_count++;
+            }
         } else {
-            s_state.error_count++;
-            s_mr60.state = MR60_WAIT_HEADER_H;
+            /* Zero-length payload — checksum byte is for empty data */
+            mr60_process_frame(s_mr60.frame_type, s_mr60.data, 0);
         }
-        break;
-    case MR60_WAIT_FOOTER_L:
-        if (b == MR60_FOOTER_L) {
-            uint16_t type = ((uint16_t)s_mr60.type_h << 8) | s_mr60.type_l;
-            mr60_process_frame(type, s_mr60.data, s_mr60.data_len);
-        } else {
-            s_state.error_count++;
-        }
-        s_mr60.state = MR60_WAIT_HEADER_H;
+        s_mr60.state = MR60_WAIT_SOF;
         break;
     }
 }
 
 /* ======================================================================
- * LD2410 Parser
+ * LD2410 Parser (HLK binary protocol, 256000 baud)
  * ====================================================================== */
 
 typedef enum {
@@ -222,34 +240,34 @@ static void ld2410_process_frame(const uint8_t *data, uint16_t len)
     s_state.frame_count++;
     s_state.last_update_us = esp_timer_get_time();
 
-    if (len < 2) return;
+    if (len < 12) return;
 
-    uint8_t frame_type = data[0];  /* 0x01 = engineering, 0x02 = target */
+    uint8_t data_type = data[0];   /* 0x02 = normal, 0x01 = engineering */
+    uint8_t head_marker = data[1]; /* Must be 0xAA */
 
-    if (frame_type == 0x02 && len >= 8) {
-        /* Target report frame:
-         * [0] frame_type=0x02
-         * [1] target_state (0=none, 1=moving, 2=static, 3=both)
-         * [2..3] moving_distance (cm, LE u16)
-         * [4]    moving_energy (0-100)
-         * [5..6] static_distance (cm, LE u16)
-         * [7]    static_energy (0-100)
-         */
-        uint8_t target_state = data[1];
-        uint16_t moving_dist = data[2] | ((uint16_t)data[3] << 8);
-        uint16_t static_dist = data[5] | ((uint16_t)data[6] << 8);
+    if (head_marker != LD2410_REPORT_HEAD) return;
 
-        s_state.person_present = (target_state != 0);
-        s_state.target_count = (target_state != 0) ? 1 : 0;
+    /* Normal mode target report (data_type 0x02 or 0x01) */
+    uint8_t  target_state  = data[2];
+    uint16_t moving_dist   = data[3] | ((uint16_t)data[4] << 8);
+    uint8_t  moving_energy = data[5];
+    uint16_t static_dist   = data[6] | ((uint16_t)data[7] << 8);
+    uint8_t  static_energy = data[8];
+    uint16_t detect_dist   = data[9] | ((uint16_t)data[10] << 8);
 
-        /* Use closest target distance. */
-        if (target_state == 1 || target_state == 3) {
-            s_state.distance_cm = (float)moving_dist;
-        } else if (target_state == 2) {
-            s_state.distance_cm = (float)static_dist;
-        } else {
-            s_state.distance_cm = 0.0f;
-        }
+    (void)moving_energy;
+    (void)static_energy;
+    (void)detect_dist;
+
+    s_state.person_present = (target_state != 0);
+    s_state.target_count = (target_state != 0) ? 1 : 0;
+
+    if (target_state == 1 || target_state == 3) {
+        s_state.distance_cm = (float)moving_dist;
+    } else if (target_state == 2) {
+        s_state.distance_cm = (float)static_dist;
+    } else {
+        s_state.distance_cm = 0.0f;
     }
 }
 
@@ -349,43 +367,61 @@ static void mock_mmwave_task(void *arg)
 #ifndef CONFIG_CSI_MOCK_ENABLED
 
 /**
- * Probe UART for known sensor headers.
- * Reads bytes for MMWAVE_PROBE_TIMEOUT_MS and checks for MR60BHA2 or LD2410 headers.
+ * Try to detect a sensor at the given baud rate.
+ * Returns the sensor type if detected, MMWAVE_TYPE_NONE otherwise.
  */
-static mmwave_type_t probe_sensor(void)
+static mmwave_type_t probe_at_baud(uint32_t baud)
 {
+    /* Reconfigure baud rate. */
+    uart_set_baudrate(MMWAVE_UART_NUM, baud);
+    uart_flush_input(MMWAVE_UART_NUM);
+
     uint8_t buf[128];
-    int mr60_header_seen = 0;
+    int mr60_sof_seen = 0;
     int ld2410_header_seen = 0;
 
-    int64_t deadline = esp_timer_get_time() + (int64_t)MMWAVE_PROBE_TIMEOUT_MS * 1000;
+    int64_t deadline = esp_timer_get_time() + (int64_t)(MMWAVE_PROBE_TIMEOUT_MS / 2) * 1000;
 
     while (esp_timer_get_time() < deadline) {
         int len = uart_read_bytes(MMWAVE_UART_NUM, buf, sizeof(buf), pdMS_TO_TICKS(100));
         if (len <= 0) continue;
 
-        for (int i = 0; i < len - 1; i++) {
-            /* MR60BHA2: 0x53 0x59 */
-            if (buf[i] == 0x53 && buf[i + 1] == 0x59) {
-                mr60_header_seen++;
+        for (int i = 0; i < len; i++) {
+            /* MR60BHA2: SOF = 0x01, followed by valid-looking frame_id bytes */
+            if (buf[i] == MR60_SOF && baud == MMWAVE_MR60_BAUD) {
+                mr60_sof_seen++;
             }
-            /* LD2410: 0xF4 0xF3 */
+            /* LD2410: 4-byte header 0xF4F3F2F1 */
             if (i + 3 < len && buf[i] == 0xF4 && buf[i+1] == 0xF3
-                && buf[i+2] == 0xF2 && buf[i+3] == 0xF1) {
+                && buf[i+2] == 0xF2 && buf[i+3] == 0xF1
+                && baud == MMWAVE_LD2410_BAUD) {
                 ld2410_header_seen++;
             }
         }
 
-        /* If we've seen multiple headers, we're confident. */
-        if (mr60_header_seen >= 2) return MMWAVE_TYPE_MR60BHA2;
+        if (mr60_sof_seen >= 3) return MMWAVE_TYPE_MR60BHA2;
         if (ld2410_header_seen >= 2) return MMWAVE_TYPE_LD2410;
     }
 
-    /* Return best guess if we saw at least one header. */
-    if (mr60_header_seen > 0) return MMWAVE_TYPE_MR60BHA2;
+    if (mr60_sof_seen > 0) return MMWAVE_TYPE_MR60BHA2;
     if (ld2410_header_seen > 0) return MMWAVE_TYPE_LD2410;
 
     return MMWAVE_TYPE_NONE;
+}
+
+/**
+ * Auto-detect sensor by probing at both baud rates.
+ * MR60BHA2 uses 115200, LD2410 uses 256000.
+ */
+static mmwave_type_t probe_sensor(void)
+{
+    ESP_LOGI(TAG, "Probing at %d baud (MR60BHA2)...", MMWAVE_MR60_BAUD);
+    mmwave_type_t result = probe_at_baud(MMWAVE_MR60_BAUD);
+    if (result != MMWAVE_TYPE_NONE) return result;
+
+    ESP_LOGI(TAG, "Probing at %d baud (LD2410)...", MMWAVE_LD2410_BAUD);
+    result = probe_at_baud(MMWAVE_LD2410_BAUD);
+    return result;
 }
 
 static void mmwave_uart_task(void *arg)
@@ -411,7 +447,6 @@ static void mmwave_uart_task(void *arg)
             }
         }
 
-        /* Yield to prevent watchdog starvation. */
         vTaskDelay(1);
     }
 
@@ -443,7 +478,6 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
     s_running = true;
 
 #ifdef CONFIG_CSI_MOCK_ENABLED
-    /* Under QEMU: use mock generator instead of real UART. */
     ESP_LOGI(TAG, "Mock mode: starting synthetic mmWave generator");
 
     BaseType_t ret = xTaskCreatePinnedToCore(
@@ -458,12 +492,12 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
     return ESP_OK;
 
 #else
-    /* Real hardware: configure UART and probe for sensor. */
-    if (uart_tx_pin < 0) uart_tx_pin = 17;  /* Default GPIO17 */
-    if (uart_rx_pin < 0) uart_rx_pin = 18;  /* Default GPIO18 */
+    if (uart_tx_pin < 0) uart_tx_pin = 17;
+    if (uart_rx_pin < 0) uart_rx_pin = 18;
 
+    /* Install UART driver at MR60 baud (will be changed during probe). */
     uart_config_t uart_config = {
-        .baud_rate = MMWAVE_UART_BAUD,
+        .baud_rate = MMWAVE_MR60_BAUD,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -492,10 +526,14 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
         return ESP_ERR_NOT_FOUND;
     }
 
+    /* Set final baud rate for the detected sensor. */
+    uint32_t final_baud = (detected == MMWAVE_TYPE_LD2410)
+                          ? MMWAVE_LD2410_BAUD : MMWAVE_MR60_BAUD;
+    uart_set_baudrate(MMWAVE_UART_NUM, final_baud);
+
     s_state.type = detected;
     s_state.detected = true;
 
-    /* Register capabilities based on sensor type. */
     switch (detected) {
     case MMWAVE_TYPE_MR60BHA2:
         s_state.capabilities = MMWAVE_CAP_HEART_RATE | MMWAVE_CAP_BREATHING
@@ -508,10 +546,10 @@ esp_err_t mmwave_sensor_init(int uart_tx_pin, int uart_rx_pin)
         break;
     }
 
-    ESP_LOGI(TAG, "Detected %s (caps=0x%04x)", mmwave_type_name(detected),
+    ESP_LOGI(TAG, "Detected %s at %lu baud (caps=0x%04x)",
+             mmwave_type_name(detected), (unsigned long)final_baud,
              s_state.capabilities);
 
-    /* Start UART reader task. */
     BaseType_t ret = xTaskCreatePinnedToCore(
         mmwave_uart_task, "mmwave_uart", MMWAVE_TASK_STACK,
         NULL, MMWAVE_TASK_PRIORITY, NULL, 0);
