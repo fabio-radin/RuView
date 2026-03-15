@@ -114,7 +114,9 @@ jobs:
         run: /opt/qemu-esp32/bin/qemu-system-xtensa --version
 
       - name: Install Python dependencies
-        run: pip3 install esptool esp-idf-nvs-partition-gen
+        run: |
+          . $IDF_PATH/export.sh
+          pip install esptool esp-idf-nvs-partition-gen
 
       - name: Set target ESP32-S3
         working-directory: firmware/esp32-csi-node
@@ -324,7 +326,9 @@ jobs:
         run: chmod +x /opt/qemu-esp32/bin/qemu-system-xtensa
 
       - name: Install Python dependencies
-        run: pip3 install pyyaml esptool esp-idf-nvs-partition-gen
+        run: |
+          . $IDF_PATH/export.sh
+          pip install pyyaml esptool esp-idf-nvs-partition-gen
 
       - name: Build firmware for swarm
         working-directory: firmware/esp32-csi-node
