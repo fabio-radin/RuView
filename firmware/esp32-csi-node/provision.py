@@ -83,25 +83,20 @@ def generate_nvs_binary(csv_content, size):
     bin_path = csv_path.replace(".csv", ".bin")
 
     try:
-        # Try the pip-installed version first (esp_idf_nvs_partition_gen package)
-        try:
-            from esp_idf_nvs_partition_gen import nvs_partition_gen
-            nvs_partition_gen.generate(csv_path, bin_path, size)
-            with open(bin_path, "rb") as f:
-                return f.read()
-        except ImportError:
-            pass
+        # Method 1: subprocess invocation (most reliable across package versions)
+        for module_name in ["esp_idf_nvs_partition_gen", "nvs_partition_gen"]:
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", module_name, "generate",
+                     csv_path, bin_path, hex(size)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                with open(bin_path, "rb") as f:
+                    return f.read()
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
 
-        # Try legacy import name (older versions)
-        try:
-            import nvs_partition_gen
-            nvs_partition_gen.generate(csv_path, bin_path, size)
-            with open(bin_path, "rb") as f:
-                return f.read()
-        except ImportError:
-            pass
-
-        # Fall back to calling the ESP-IDF script directly
+        # Method 2: ESP-IDF bundled script
         idf_path = os.environ.get("IDF_PATH", "")
         gen_script = os.path.join(idf_path, "components", "nvs_flash",
                                   "nvs_partition_generator", "nvs_partition_gen.py")
@@ -113,13 +108,10 @@ def generate_nvs_binary(csv_content, size):
             with open(bin_path, "rb") as f:
                 return f.read()
 
-        # Last resort: try as a module
-        subprocess.check_call([
-            sys.executable, "-m", "nvs_partition_gen", "generate",
-            csv_path, bin_path, hex(size)
-        ])
-        with open(bin_path, "rb") as f:
-            return f.read()
+        raise RuntimeError(
+            "NVS partition generator not available. "
+            "Install: pip install esp-idf-nvs-partition-gen"
+        )
 
     finally:
         for p in (csv_path, bin_path):
