@@ -46,3 +46,7 @@ proptest.workspace = true
 [[bench]]
 name = "signal_bench"
 harness = false
+
+[[bench]]
+name = "full_pipeline_bench"
+harness = false

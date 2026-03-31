@@ -1,0 +1,12 @@
+{
+  "language": "Python v1",
+  "pipeline": "preprocess -> extract_features -> detect_human_presence",
+  "frames": 1000,
+  "mean_us": 136.9106,
+  "median_us": 125.3,
+  "p95_us": 197.8,
+  "p99_us": 288.5,
+  "min_us": 112.1,
+  "max_us": 627.2,
+  "fps": 7304.036356571369
+}
