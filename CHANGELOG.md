@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.5.4-esp32] — 2026-04-02
+
+### Added
+- **ADR-069: ESP32 CSI → Cognitum Seed RVF ingest pipeline** — Live-validated pipeline connecting ESP32-S3 CSI sensing to Cognitum Seed (Pi Zero 2 W) edge intelligence appliance. 339 vectors ingested, 100% kNN validation, SHA-256 witness chain verified.
+- **Feature vector packet (magic 0xC5110003)** — New 48-byte packet with 8 normalized dimensions (presence, motion, breathing, heart rate, phase variance, person count, fall, RSSI) sent at 1 Hz alongside vitals.
+- **`scripts/seed_csi_bridge.py`** — Python bridge: UDP listener → HTTPS ingest with bearer token auth, `--validate` (kNN + PIR ground truth), `--stats`, `--compact` modes, hash-based vector IDs, NaN/inf rejection, source IP filtering, retry logic.
+- **Arena Physica research** — 26 research documents in `docs/research/` covering Maxwell's equations in WiFi sensing, Arena Physica Studio analysis, SOTA WiFi sensing 2025-2026, GOAP implementation plan for ESP32 + Pi Zero.
+- **Cognitum Seed MCP integration** — 114-tool MCP proxy enables AI assistants to query sensing state, vectors, witness chain, and device status directly.
+
+### Fixed
+- **Compressed frame magic collision** — Reassigned compressed frame magic from `0xC5110003` to `0xC5110005` to free `0xC5110003` for feature vectors.
+- **Uninitialized `s_top_k[0]` read** — Guarded variance computation against `s_top_k_count == 0` in `send_feature_vector()`.
+- **Presence score normalization** — Bridge now divides by 15.0 instead of clamping, preserving dynamic range for raw values 1.41-14.92.
+- **Stale magic references** — Updated ADR-039, DDD model to reflect `0xC5110005` for compressed frames.
+
+### Security
+- **Credential exposure remediation** — Removed hardcoded WiFi passwords and bearer tokens from source files. Added NVS binary/CSV patterns to `.gitignore`. Environment variable fallback for bearer token.
+- **NaN/Inf injection prevention** — Bridge validates all feature dimensions are finite before Seed ingest.
+- **UDP source filtering** — `--allowed-sources` argument restricts packet acceptance to known ESP32 IPs.
+
+### Changed
+- Wire format table now includes 6 magic numbers: `0xC5110001` (raw), `0xC5110002` (vitals), `0xC5110003` (features), `0xC5110004` (WASM events), `0xC5110005` (compressed), `0xC5110006` (fused vitals).
+
+## [v0.5.3-esp32] — 2026-03-30
+
+### Added
+- **Cross-node RSSI-weighted feature fusion** — Multiple ESP32 nodes fuse CSI features using RSSI-based weighting. Closer node gets higher weight. Reduces variance noise by 29%, keypoint jitter by 72%.
+- **DynamicMinCut person separation** — Uses `ruvector_mincut::DynamicMinCut` on the subcarrier temporal correlation graph to detect independent motion clusters. Replaces variance-based heuristic for multi-person counting.
+- **RSSI-based position tracking** — Skeleton position driven by RSSI differential between nodes. Walk between ESP32s and the skeleton follows you.
+- **Per-node state pipeline (ADR-068)** — Each ESP32 node gets independent `HashMap<u8, NodeState>` with frame history, classification, vitals, and person count. Fixes #249 (the #1 user-reported issue).
+- **RuVector Phase 1-3 integration** — Subcarrier importance weighting, temporal keypoint smoothing (EMA), coherence gating, skeleton kinematic constraints (Jakobsen relaxation), compressed pose history.
+- **Client-side lerp smoothing** — UI keypoints interpolate between frames (alpha=0.15) for fluid skeleton movement.
+- **Multi-node mesh tests** — 8 integration tests covering 1-255 node configurations.
+- **`wifi_densepose` Python package** — `from wifi_densepose import WiFiDensePose` now works (#314).
+
+### Fixed
+- **Watchdog crash on busy LANs (#321)** — Batch-limited edge_dsp to 4 frames before 20ms yield. Fixed idle-path busy-spin (`pdMS_TO_TICKS(5)==0`).
+- **No detection from edge vitals (#323)** — Server now generates `sensing_update` from Tier 2+ vitals packets.
+- **RSSI byte offset mismatch (#332)** — Server parsed RSSI from wrong byte (was reading sequence counter).
+- **Stack overflow risk** — Moved 4KB of BPM scratch buffers from stack to static storage.
+- **Stale node memory leak** — `node_states` HashMap evicts nodes inactive >60s.
+- **Unsafe raw pointer removed** — Replaced with safe `.clone()` for adaptive model borrow.
+- **Firmware CI** — Upgraded to IDF v5.4, replaced `xxd` with `od` (#327).
+- **Person count double-counting** — Multi-node aggregation changed from `sum` to `max`.
+- **Skeleton jitter** — Removed tick-based noise, dampened procedural animation, recalibrated feature scaling for real ESP32 data.
+
+### Changed
+- Motion-responsive skeleton: arm swing (0-80px) driven by CSI variance, leg kick (0-50px) by motion_band_power, vertical bob when walking.
+- Person count thresholds recalibrated for real ESP32 hardware (1→2 at 0.70, EMA alpha 0.04).
+- Vital sign filtering: larger median window (31), faster EMA (0.05), looser HR jump filter (15 BPM).
+- Vendored ruvector updated to v2.1.0-40 (316 commits ahead).
+
+### Benchmarks (2-node mesh, COM6 + COM9, 30s)
+| Metric | Baseline | v0.5.3 | Improvement |
+|--------|----------|--------|-------------|
+| Variance noise | 109.4 | 77.6 | **-29%** |
+| Feature stability | std=154.1 | std=105.4 | **-32%** |
+| Keypoint jitter | std=4.5px | std=1.3px | **-72%** |
+| Confidence | 0.643 | 0.686 | **+7%** |
+| Presence accuracy | 93.4% | 94.6% | **+1.3pp** |
+
+### Verified
+- Real hardware: COM6 (node 1) + COM9 (node 2) on ruv.net WiFi
+- All 284 Rust tests pass, 352 signal crate tests pass
+- Firmware builds clean at 843 KB
+- QEMU CI: 11/11 jobs green
+
+## [v0.5.2-esp32] — 2026-03-28
+
+### Fixed
+- RSSI byte offset in frame parser (#332)
+- Per-node state pipeline for multi-node sensing (#249)
+- Firmware CI upgraded to IDF v5.4 (#327)
+
+## [v0.5.1-esp32] — 2026-03-27
+
+### Fixed
+- Watchdog crash on busy LANs (#321)
+- No detection from edge vitals (#323)
+- `wifi_densepose` Python package import (#314)
+- Pre-compiled firmware binaries added to release
+
 ## [v0.5.0-esp32] — 2026-03-15
 
 ### Added

@@ -9,14 +9,18 @@
 //! Replaces both ws_server.py and the Python HTTP server.
 
 mod adaptive_classifier;
+mod field_bridge;
+mod multistatic_bridge;
 mod rvf_container;
 mod rvf_pipeline;
+mod tracker_bridge;
 mod vital_signs;
 
 // Training pipeline modules (exposed via lib.rs)
 use wifi_densepose_sensing_server::{graph_transformer, trainer, dataset, embedding};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use ruvector_mincut::{DynamicMinCut, MinCutBuilder};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,6 +55,11 @@ use wifi_densepose_wifiscan::{
     BssidRegistry, WindowsWifiPipeline,
 };
 use wifi_densepose_wifiscan::parse_netsh_output as parse_netsh_bssid_output;
+
+// Accuracy sprint: Kalman tracker, multistatic fusion, field model
+use wifi_densepose_signal::ruvsense::pose_tracker::PoseTracker;
+use wifi_densepose_signal::ruvsense::multistatic::{MultistaticFuser, MultistaticConfig};
+use wifi_densepose_signal::ruvsense::field_model::{FieldModel, CalibrationStatus};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -144,6 +153,14 @@ struct Args {
     /// Build fingerprint index from embeddings (env|activity|temporal|person)
     #[arg(long, value_name = "TYPE")]
     build_index: Option<String>,
+
+    /// Node positions for multistatic fusion (format: "x,y,z;x,y,z;...")
+    #[arg(long, env = "SENSING_NODE_POSITIONS")]
+    node_positions: Option<String>,
+
+    /// Start field model calibration on boot (empty room required)
+    #[arg(long)]
+    calibrate: bool,
 }
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -212,6 +229,9 @@ struct SensingUpdate {
     /// Estimated person count from CSI feature heuristics (1-3 for single ESP32).
     #[serde(skip_serializing_if = "Option::is_none")]
     estimated_persons: Option<usize>,
+    /// Per-node feature breakdown for multi-node deployments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_features: Option<Vec<PerNodeFeatureInfo>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +295,131 @@ struct BoundingBox {
     height: f64,
 }
 
+/// Per-node sensing state for multi-node deployments (issue #249).
+/// Each ESP32 node gets its own frame history, smoothing buffers, and vital
+/// sign detector so that data from different nodes is never mixed.
+struct NodeState {
+    pub(crate) frame_history: VecDeque<Vec<f64>>,
+    smoothed_person_score: f64,
+    pub(crate) prev_person_count: usize,
+    smoothed_motion: f64,
+    current_motion_level: String,
+    debounce_counter: u32,
+    debounce_candidate: String,
+    baseline_motion: f64,
+    baseline_frames: u64,
+    smoothed_hr: f64,
+    smoothed_br: f64,
+    smoothed_hr_conf: f64,
+    smoothed_br_conf: f64,
+    hr_buffer: VecDeque<f64>,
+    br_buffer: VecDeque<f64>,
+    rssi_history: VecDeque<f64>,
+    vital_detector: VitalSignDetector,
+    latest_vitals: VitalSigns,
+    pub(crate) last_frame_time: Option<std::time::Instant>,
+    edge_vitals: Option<Esp32VitalsPacket>,
+    /// Latest extracted features for cross-node fusion.
+    latest_features: Option<FeatureInfo>,
+    // ── RuVector Phase 2: Temporal smoothing & coherence gating ──
+    /// Previous frame's smoothed keypoint positions for EMA temporal smoothing.
+    prev_keypoints: Option<Vec<[f64; 3]>>,
+    /// Rolling buffer of motion_energy values for coherence scoring (last 20 frames).
+    motion_energy_history: VecDeque<f64>,
+    /// Coherence score [0.0, 1.0]: low variance in motion_energy = high coherence.
+    coherence_score: f64,
+}
+
+/// Default EMA alpha for temporal keypoint smoothing (RuVector Phase 2).
+/// Lower = smoother (more history, less jitter). 0.15 balances responsiveness
+/// with stability for WiFi CSI where per-frame noise is high.
+const TEMPORAL_EMA_ALPHA_DEFAULT: f64 = 0.15;
+/// Reduced EMA alpha when coherence is low (trust measurements less).
+const TEMPORAL_EMA_ALPHA_LOW_COHERENCE: f64 = 0.05;
+/// Coherence threshold below which we reduce EMA alpha.
+const COHERENCE_LOW_THRESHOLD: f64 = 0.3;
+/// Maximum allowed bone-length change ratio between frames (20%).
+const MAX_BONE_CHANGE_RATIO: f64 = 0.20;
+/// Number of motion_energy frames to track for coherence scoring.
+const COHERENCE_WINDOW: usize = 20;
+
+impl NodeState {
+    pub(crate) fn new() -> Self {
+        Self {
+            frame_history: VecDeque::new(),
+            smoothed_person_score: 0.0,
+            prev_person_count: 0,
+            smoothed_motion: 0.0,
+            current_motion_level: "absent".to_string(),
+            debounce_counter: 0,
+            debounce_candidate: "absent".to_string(),
+            baseline_motion: 0.0,
+            baseline_frames: 0,
+            smoothed_hr: 0.0,
+            smoothed_br: 0.0,
+            smoothed_hr_conf: 0.0,
+            smoothed_br_conf: 0.0,
+            hr_buffer: VecDeque::with_capacity(8),
+            br_buffer: VecDeque::with_capacity(8),
+            rssi_history: VecDeque::new(),
+            vital_detector: VitalSignDetector::new(10.0),
+            latest_vitals: VitalSigns::default(),
+            last_frame_time: None,
+            edge_vitals: None,
+            latest_features: None,
+            prev_keypoints: None,
+            motion_energy_history: VecDeque::with_capacity(COHERENCE_WINDOW),
+            coherence_score: 1.0, // assume stable initially
+        }
+    }
+
+    /// Update the coherence score from the latest motion_energy value.
+    ///
+    /// Coherence is computed as 1.0 / (1.0 + running_variance) so that
+    /// low motion-energy variance maps to high coherence ([0, 1]).
+    fn update_coherence(&mut self, motion_energy: f64) {
+        if self.motion_energy_history.len() >= COHERENCE_WINDOW {
+            self.motion_energy_history.pop_front();
+        }
+        self.motion_energy_history.push_back(motion_energy);
+
+        let n = self.motion_energy_history.len();
+        if n < 2 {
+            self.coherence_score = 1.0;
+            return;
+        }
+
+        let mean: f64 = self.motion_energy_history.iter().sum::<f64>() / n as f64;
+        let variance: f64 = self.motion_energy_history.iter()
+            .map(|v| (v - mean) * (v - mean))
+            .sum::<f64>() / (n - 1) as f64;
+
+        // Map variance to [0, 1] coherence: higher variance = lower coherence.
+        self.coherence_score = (1.0 / (1.0 + variance)).clamp(0.0, 1.0);
+    }
+
+    /// Choose the EMA alpha based on current coherence score.
+    fn ema_alpha(&self) -> f64 {
+        if self.coherence_score < COHERENCE_LOW_THRESHOLD {
+            TEMPORAL_EMA_ALPHA_LOW_COHERENCE
+        } else {
+            TEMPORAL_EMA_ALPHA_DEFAULT
+        }
+    }
+}
+
+/// Per-node feature info for WebSocket broadcasts (multi-node support).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PerNodeFeatureInfo {
+    node_id: u8,
+    features: FeatureInfo,
+    classification: ClassificationInfo,
+    rssi_dbm: f64,
+    last_seen_ms: u64,
+    frame_rate_hz: f64,
+    stale: bool,
+}
+
 /// Shared application state
 struct AppStateInner {
     latest_update: Option<SensingUpdate>,
@@ -285,6 +430,8 @@ struct AppStateInner {
     frame_history: VecDeque<Vec<f64>>,
     tick: u64,
     source: String,
+    /// Instant of the last ESP32 UDP frame received (for offline detection).
+    last_esp32_frame: Option<std::time::Instant>,
     tx: broadcast::Sender<String>,
     total_detections: u64,
     start_time: std::time::Instant,
@@ -304,6 +451,8 @@ struct AppStateInner {
     model_loaded: bool,
     /// Smoothed person count (EMA) for hysteresis — prevents frame-to-frame jumping.
     smoothed_person_score: f64,
+    /// Previous person count for hysteresis (asymmetric up/down thresholds).
+    prev_person_count: usize,
     // ── Motion smoothing & adaptive baseline (ADR-047 tuning) ────────────
     /// EMA-smoothed motion score (alpha ~0.15 for ~10 FPS → ~1s time constant).
     smoothed_motion: f64,
@@ -360,6 +509,63 @@ struct AppStateInner {
     // ── Adaptive classifier (environment-tuned) ──────────────────────────
     /// Trained adaptive model (loaded from data/adaptive_model.json or trained at runtime).
     adaptive_model: Option<adaptive_classifier::AdaptiveModel>,
+    // ── Per-node state (issue #249) ─────────────────────────────────────
+    /// Per-node sensing state for multi-node deployments.
+    /// Keyed by `node_id` from the ESP32 frame header.
+    node_states: HashMap<u8, NodeState>,
+    // ── Accuracy sprint: Kalman tracker, multistatic fusion, eigenvalue counting ──
+    /// Global Kalman-based pose tracker for stable person IDs and smoothed keypoints.
+    pose_tracker: PoseTracker,
+    /// Instant of last tracker update (for computing dt).
+    last_tracker_instant: Option<std::time::Instant>,
+    /// Attention-weighted multi-node CSI fusion engine.
+    multistatic_fuser: MultistaticFuser,
+    /// SVD-based room field model for eigenvalue person counting (None until calibration).
+    field_model: Option<FieldModel>,
+}
+
+/// If no ESP32 frame arrives within this duration, source reverts to offline.
+const ESP32_OFFLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl AppStateInner {
+    /// Return the effective data source, accounting for ESP32 frame timeout.
+    /// If the source is "esp32" but no frame has arrived in 5 seconds, returns
+    /// "esp32:offline" so the UI can distinguish active vs stale connections.
+    /// Person count: eigenvalue-based if field model is calibrated, else heuristic.
+    /// Uses global frame_history if populated, otherwise the freshest per-node history.
+    fn person_count(&self) -> usize {
+        match self.field_model.as_ref() {
+            Some(fm) => {
+                // Prefer global frame_history (populated by wifi/simulate paths).
+                // Fall back to freshest per-node history (populated by ESP32 paths).
+                let history = if !self.frame_history.is_empty() {
+                    &self.frame_history
+                } else {
+                    // Find the node with the most recent frame
+                    self.node_states.values()
+                        .filter(|ns| !ns.frame_history.is_empty())
+                        .max_by_key(|ns| ns.last_frame_time)
+                        .map(|ns| &ns.frame_history)
+                        .unwrap_or(&self.frame_history)
+                };
+                field_bridge::occupancy_or_fallback(
+                    fm, history, self.smoothed_person_score, self.prev_person_count,
+                )
+            }
+            None => score_to_person_count(self.smoothed_person_score, self.prev_person_count),
+        }
+    }
+
+    fn effective_source(&self) -> String {
+        if self.source == "esp32" {
+            if let Some(last) = self.last_esp32_frame {
+                if last.elapsed() > ESP32_OFFLINE_TIMEOUT {
+                    return "esp32:offline".to_string();
+                }
+            }
+        }
+        self.source.clone()
+    }
 }
 
 /// Number of frames retained in `frame_history` for temporal analysis.
@@ -485,12 +691,25 @@ fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
         return None;
     }
 
+    // Frame layout (must match firmware csi_collector.c):
+    //   [0..3]   magic (u32 LE)
+    //   [4]      node_id (u8)
+    //   [5]      n_antennas (u8)
+    //   [6..7]   n_subcarriers (u16 LE)
+    //   [8..11]  freq_mhz (u32 LE)
+    //   [12..15] sequence (u32 LE)
+    //   [16]     rssi (i8)
+    //   [17]     noise_floor (i8)
+    //   [18..19] reserved
+    //   [20..]   I/Q data
     let node_id = buf[4];
     let n_antennas = buf[5];
     let n_subcarriers = buf[6];
     let freq_mhz = u16::from_le_bytes([buf[8], buf[9]]);
     let sequence = u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]);
-    let rssi = buf[14] as i8;
+    let rssi_raw = buf[14] as i8;
+    // Fix RSSI sign: ensure it's always negative (dBm convention).
+    let rssi = if rssi_raw > 0 { rssi_raw.saturating_neg() } else { rssi_raw };
     let noise_floor = buf[15] as i8;
 
     let iq_start = 20;
@@ -712,6 +931,40 @@ fn estimate_breathing_rate_hz(frame_history: &VecDeque<Vec<f64>>, sample_rate_hz
 /// For each subcarrier index `k`, returns `Var[A_k]` over all stored frames.
 /// This captures spatial signal variation; subcarriers whose amplitude fluctuates
 /// heavily across time correspond to directions with motion.
+/// Compute per-subcarrier importance weights using a simple sensitivity split.
+///
+/// Subcarriers whose sensitivity (amplitude magnitude) is above the median are
+/// considered "sensitive" and receive weight `1.0 + (sens / max_sens)` (range 1.0–2.0).
+/// The rest receive a baseline weight of 0.5. This mirrors the RuVector mincut
+/// partition logic without requiring the graph dependency.
+fn compute_subcarrier_importance_weights(sensitivity: &[f64]) -> Vec<f64> {
+    let n = sensitivity.len();
+    if n == 0 {
+        return vec![];
+    }
+    let max_sens = sensitivity.iter().cloned().fold(f64::NEG_INFINITY, f64::max).max(1e-9);
+
+    // Compute median via a sorted copy.
+    let mut sorted = sensitivity.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if n % 2 == 0 {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    } else {
+        sorted[n / 2]
+    };
+
+    sensitivity
+        .iter()
+        .map(|&s| {
+            if s >= median {
+                1.0 + (s / max_sens).min(1.0)
+            } else {
+                0.5
+            }
+        })
+        .collect()
+}
+
 fn compute_subcarrier_variances(frame_history: &VecDeque<Vec<f64>>, n_sub: usize) -> Vec<f64> {
     if frame_history.is_empty() || n_sub == 0 {
         return vec![0.0; n_sub];
@@ -760,13 +1013,34 @@ fn extract_features_from_frame(
 ) -> (FeatureInfo, ClassificationInfo, f64, Vec<f64>, f64) {
     let n_sub = frame.amplitudes.len().max(1);
     let n = n_sub as f64;
-    let mean_amp: f64 = frame.amplitudes.iter().sum::<f64>() / n;
     let mean_rssi = frame.rssi as f64;
 
-    // ── Intra-frame subcarrier variance (spatial spread across subcarriers) ──
-    let intra_variance: f64 = frame.amplitudes.iter()
-        .map(|a| (a - mean_amp).powi(2))
-        .sum::<f64>() / n;
+    // ── RuVector Phase 1: subcarrier importance weighting ──
+    // Compute per-subcarrier sensitivity from amplitude magnitude, then weight
+    // sensitive subcarriers higher (>1.0) and insensitive ones lower (0.5).
+    // This emphasises body-motion-correlated subcarriers in all downstream metrics.
+    let sub_sensitivity: Vec<f64> = frame.amplitudes.iter().map(|a| a.abs()).collect();
+    let importance_weights = compute_subcarrier_importance_weights(&sub_sensitivity);
+
+    let weight_sum: f64 = importance_weights.iter().sum::<f64>();
+    let mean_amp: f64 = if weight_sum > 0.0 {
+        frame.amplitudes.iter().zip(importance_weights.iter())
+            .map(|(a, w)| a * w)
+            .sum::<f64>() / weight_sum
+    } else {
+        frame.amplitudes.iter().sum::<f64>() / n
+    };
+
+    // ── Intra-frame subcarrier variance (weighted by importance) ──
+    let intra_variance: f64 = if weight_sum > 0.0 {
+        frame.amplitudes.iter().zip(importance_weights.iter())
+            .map(|(a, w)| w * (a - mean_amp).powi(2))
+            .sum::<f64>() / weight_sum
+    } else {
+        frame.amplitudes.iter()
+            .map(|a| (a - mean_amp).powi(2))
+            .sum::<f64>() / n
+    };
 
     // ── Temporal (sliding-window) per-subcarrier variance ──
     let sub_variances = compute_subcarrier_variances(frame_history, n_sub);
@@ -941,6 +1215,44 @@ fn smooth_and_classify(state: &mut AppStateInner, raw: &mut ClassificationInfo, 
     raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
 }
 
+/// Per-node variant of `smooth_and_classify` that operates on a `NodeState`
+/// instead of `AppStateInner` (issue #249).
+fn smooth_and_classify_node(ns: &mut NodeState, raw: &mut ClassificationInfo, raw_motion: f64) {
+    ns.baseline_frames += 1;
+    if ns.baseline_frames < BASELINE_WARMUP {
+        ns.baseline_motion = ns.baseline_motion * 0.9 + raw_motion * 0.1;
+    } else if raw_motion < ns.smoothed_motion + 0.05 {
+        ns.baseline_motion = ns.baseline_motion * (1.0 - BASELINE_EMA_ALPHA)
+                           + raw_motion * BASELINE_EMA_ALPHA;
+    }
+
+    let adjusted = (raw_motion - ns.baseline_motion * 0.7).max(0.0);
+
+    ns.smoothed_motion = ns.smoothed_motion * (1.0 - MOTION_EMA_ALPHA)
+                       + adjusted * MOTION_EMA_ALPHA;
+    let sm = ns.smoothed_motion;
+
+    let candidate = raw_classify(sm);
+
+    if candidate == ns.current_motion_level {
+        ns.debounce_counter = 0;
+        ns.debounce_candidate = candidate;
+    } else if candidate == ns.debounce_candidate {
+        ns.debounce_counter += 1;
+        if ns.debounce_counter >= DEBOUNCE_FRAMES {
+            ns.current_motion_level = candidate;
+            ns.debounce_counter = 0;
+        }
+    } else {
+        ns.debounce_candidate = candidate;
+        ns.debounce_counter = 1;
+    }
+
+    raw.motion_level = ns.current_motion_level.clone();
+    raw.presence = sm > 0.03;
+    raw.confidence = (0.4 + sm * 0.6).clamp(0.0, 1.0);
+}
+
 /// If an adaptive model is loaded, override the classification with the
 /// model's prediction.  Uses the full 15-feature vector for higher accuracy.
 fn adaptive_override(state: &AppStateInner, features: &FeatureInfo, classification: &mut ClassificationInfo) {
@@ -1037,6 +1349,55 @@ fn smooth_vitals(state: &mut AppStateInner, raw: &VitalSigns) -> VitalSigns {
         heart_rate_bpm: if state.smoothed_hr > 1.0 { Some(state.smoothed_hr) } else { None },
         breathing_confidence: state.smoothed_br_conf,
         heartbeat_confidence: state.smoothed_hr_conf,
+        signal_quality: raw.signal_quality,
+    }
+}
+
+/// Per-node variant of `smooth_vitals` that operates on a `NodeState` (issue #249).
+fn smooth_vitals_node(ns: &mut NodeState, raw: &VitalSigns) -> VitalSigns {
+    let raw_hr = raw.heart_rate_bpm.unwrap_or(0.0);
+    let raw_br = raw.breathing_rate_bpm.unwrap_or(0.0);
+
+    let hr_ok = ns.smoothed_hr < 1.0 || (raw_hr - ns.smoothed_hr).abs() < HR_MAX_JUMP;
+    let br_ok = ns.smoothed_br < 1.0 || (raw_br - ns.smoothed_br).abs() < BR_MAX_JUMP;
+
+    if hr_ok && raw_hr > 0.0 {
+        ns.hr_buffer.push_back(raw_hr);
+        if ns.hr_buffer.len() > VITAL_MEDIAN_WINDOW { ns.hr_buffer.pop_front(); }
+    }
+    if br_ok && raw_br > 0.0 {
+        ns.br_buffer.push_back(raw_br);
+        if ns.br_buffer.len() > VITAL_MEDIAN_WINDOW { ns.br_buffer.pop_front(); }
+    }
+
+    let trimmed_hr = trimmed_mean(&ns.hr_buffer);
+    let trimmed_br = trimmed_mean(&ns.br_buffer);
+
+    if trimmed_hr > 0.0 {
+        if ns.smoothed_hr < 1.0 {
+            ns.smoothed_hr = trimmed_hr;
+        } else if (trimmed_hr - ns.smoothed_hr).abs() > HR_DEAD_BAND {
+            ns.smoothed_hr = ns.smoothed_hr * (1.0 - VITAL_EMA_ALPHA)
+                           + trimmed_hr * VITAL_EMA_ALPHA;
+        }
+    }
+    if trimmed_br > 0.0 {
+        if ns.smoothed_br < 1.0 {
+            ns.smoothed_br = trimmed_br;
+        } else if (trimmed_br - ns.smoothed_br).abs() > BR_DEAD_BAND {
+            ns.smoothed_br = ns.smoothed_br * (1.0 - VITAL_EMA_ALPHA)
+                           + trimmed_br * VITAL_EMA_ALPHA;
+        }
+    }
+
+    ns.smoothed_hr_conf = ns.smoothed_hr_conf * 0.92 + raw.heartbeat_confidence * 0.08;
+    ns.smoothed_br_conf = ns.smoothed_br_conf * 0.92 + raw.breathing_confidence * 0.08;
+
+    VitalSigns {
+        breathing_rate_bpm: if ns.smoothed_br > 1.0 { Some(ns.smoothed_br) } else { None },
+        heart_rate_bpm: if ns.smoothed_hr > 1.0 { Some(ns.smoothed_hr) } else { None },
+        breathing_confidence: ns.smoothed_br_conf,
+        heartbeat_confidence: ns.smoothed_hr_conf,
         signal_quality: raw.signal_quality,
     }
 }
@@ -1247,12 +1608,15 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
 
         let feat_variance = features.variance;
 
-        // Multi-person estimation with temporal smoothing (EMA α=0.15).
+        // Multi-person estimation with temporal smoothing (EMA α=0.10).
         let raw_score = compute_person_score(&features);
-        s.smoothed_person_score = s.smoothed_person_score * 0.85 + raw_score * 0.15;
+        s.smoothed_person_score = s.smoothed_person_score * 0.90 + raw_score * 0.10;
         let est_persons = if classification.presence {
-            score_to_person_count(s.smoothed_person_score)
+            let count = s.person_count();
+            s.prev_person_count = count;
+            count
         } else {
+            s.prev_person_count = 0;
             0
         };
 
@@ -1285,12 +1649,16 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             model_status: None,
             persons: None,
             estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
+            node_features: None,
         };
 
-        // Populate persons from the sensing update.
-        let persons = derive_pose_from_sensing(&update);
-        if !persons.is_empty() {
-            update.persons = Some(persons);
+        // Populate persons from the sensing update (Kalman-smoothed via tracker).
+        let raw_persons = derive_pose_from_sensing(&update);
+        let tracked = tracker_bridge::tracker_update(
+            &mut s.pose_tracker, &mut s.last_tracker_instant, raw_persons,
+        );
+        if !tracked.is_empty() {
+            update.persons = Some(tracked);
         }
 
         if let Ok(json) = serde_json::to_string(&update) {
@@ -1377,12 +1745,15 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
 
     let feat_variance = features.variance;
 
-    // Multi-person estimation with temporal smoothing.
+    // Multi-person estimation with temporal smoothing (EMA α=0.10).
     let raw_score = compute_person_score(&features);
-    s.smoothed_person_score = s.smoothed_person_score * 0.85 + raw_score * 0.15;
+    s.smoothed_person_score = s.smoothed_person_score * 0.90 + raw_score * 0.10;
     let est_persons = if classification.presence {
-        score_to_person_count(s.smoothed_person_score)
+        let count = s.person_count();
+        s.prev_person_count = count;
+        count
     } else {
+        s.prev_person_count = 0;
         0
     };
 
@@ -1415,11 +1786,15 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         model_status: None,
         persons: None,
         estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
+        node_features: None,
     };
 
-    let persons = derive_pose_from_sensing(&update);
-    if !persons.is_empty() {
-        update.persons = Some(persons);
+    let raw_persons = derive_pose_from_sensing(&update);
+    let tracked = tracker_bridge::tracker_update(
+        &mut s.pose_tracker, &mut s.last_tracker_instant, raw_persons,
+    );
+    if !tracked.is_empty() {
+        update.persons = Some(tracked);
     }
 
     if let Ok(json) = serde_json::to_string(&update) {
@@ -1596,9 +1971,13 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                             keypoints,
                                             zone: "zone_1".into(),
                                         }]
-                                    }).unwrap_or_else(|| derive_pose_from_sensing(&sensing))
+                                    }).unwrap_or_else(|| {
+                                        // Prefer tracked persons from broadcast if available
+                                        sensing.persons.clone().unwrap_or_else(|| derive_pose_from_sensing(&sensing))
+                                    })
                                 } else {
-                                    derive_pose_from_sensing(&sensing)
+                                    // Prefer tracked persons from broadcast if available
+                                    sensing.persons.clone().unwrap_or_else(|| derive_pose_from_sensing(&sensing))
                                 };
 
                                 let pose_msg = serde_json::json!({
@@ -1661,7 +2040,7 @@ async fn health(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     Json(serde_json::json!({
         "status": "ok",
-        "source": s.source,
+        "source": s.effective_source(),
         "tick": s.tick,
         "clients": s.tx.receiver_count(),
     }))
@@ -1691,6 +2070,61 @@ async fn latest(State(state): State<SharedState>) -> Json<serde_json::Value> {
 /// with a stride-swing pattern applied to arms and legs.
 // ── Multi-person estimation (issue #97) ──────────────────────────────────────
 
+/// Fuse features across all active nodes for higher SNR.
+///
+/// When multiple ESP32 nodes observe the same room, their CSI features
+/// can be combined:
+/// - Variance: use max (most sensitive node dominates)
+/// - Motion/breathing/spectral power: weighted average by RSSI (closer node = higher weight)
+/// - Dominant frequency: weighted average
+/// - Change points: keep current node's value (not meaningful to average)
+/// - Mean RSSI: use max (best signal)
+fn fuse_multi_node_features(
+    current_features: &FeatureInfo,
+    node_states: &HashMap<u8, NodeState>,
+) -> FeatureInfo {
+    let now = std::time::Instant::now();
+    let active: Vec<(&FeatureInfo, f64)> = node_states.values()
+        .filter(|ns| ns.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
+        .filter_map(|ns| {
+            let feat = ns.latest_features.as_ref()?;
+            let rssi = ns.rssi_history.back().copied().unwrap_or(-80.0);
+            Some((feat, rssi))
+        })
+        .collect();
+
+    if active.len() <= 1 {
+        return current_features.clone();
+    }
+
+    // RSSI-based weights: higher RSSI = closer to person = more weight.
+    // Map RSSI relative to best node into [0.1, 1.0].
+    let max_rssi = active.iter().map(|(_, r)| *r).fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = active.iter()
+        .map(|(_, r)| (1.0 + (r - max_rssi + 20.0) / 20.0).clamp(0.1, 1.0))
+        .collect();
+    let w_sum: f64 = weights.iter().sum::<f64>().max(1e-9);
+
+    FeatureInfo {
+        // Weighted average variance (not max — max inflates person score
+        // and causes count flips between 1↔2 persons).
+        variance: active.iter().zip(&weights)
+            .map(|((f, _), w)| f.variance * w).sum::<f64>() / w_sum,
+        // Weighted average for motion/breathing/spectral
+        motion_band_power: active.iter().zip(&weights)
+            .map(|((f, _), w)| f.motion_band_power * w).sum::<f64>() / w_sum,
+        breathing_band_power: active.iter().zip(&weights)
+            .map(|((f, _), w)| f.breathing_band_power * w).sum::<f64>() / w_sum,
+        spectral_power: active.iter().zip(&weights)
+            .map(|((f, _), w)| f.spectral_power * w).sum::<f64>() / w_sum,
+        dominant_freq_hz: active.iter().zip(&weights)
+            .map(|((f, _), w)| f.dominant_freq_hz * w).sum::<f64>() / w_sum,
+        change_points: current_features.change_points, // keep current node's value
+        // Best RSSI across nodes
+        mean_rssi: active.iter().map(|(f, _)| f.mean_rssi).fold(f64::NEG_INFINITY, f64::max),
+    }
+}
+
 /// Estimate person count from CSI features using a weighted composite heuristic.
 ///
 /// Single ESP32 link limitations: variance-based detection can reliably detect
@@ -1699,43 +2133,181 @@ async fn latest(State(state): State<SharedState>) -> Json<serde_json::Value> {
 /// Returns a raw score (0.0..1.0) that the caller converts to person count
 /// after temporal smoothing.
 fn compute_person_score(feat: &FeatureInfo) -> f64 {
-    // Normalize each feature to [0, 1] using calibrated ranges:
-    //
-    //   variance: intra-frame amp variance. 1-person ~2-15, 2-person ~15-60,
-    //     real ESP32 can go higher. Use 30.0 as scaling midpoint.
-    let var_norm = (feat.variance / 30.0).clamp(0.0, 1.0);
-
-    //   change_points: threshold crossings in 56 subcarriers. 1-person ~5-15,
-    //     2-person ~15-30. Scale by 30.0 (half of max 55).
+    // Normalize each feature to [0, 1] using ranges calibrated from real
+    // ESP32 hardware (COM6/COM9 on ruv.net, March 2026).
+    let var_norm = (feat.variance / 300.0).clamp(0.0, 1.0);
     let cp_norm = (feat.change_points as f64 / 30.0).clamp(0.0, 1.0);
-
-    //   motion_band_power: upper-half subcarrier variance. 1-person ~1-8,
-    //     2-person ~8-25. Scale by 20.0.
-    let motion_norm = (feat.motion_band_power / 20.0).clamp(0.0, 1.0);
-
-    //   spectral_power: mean squared amplitude. Highly variable (~100-1000+).
-    //     Use relative change indicator: high spectral_power with high variance
-    //     suggests multiple reflectors. Scale by 500.0.
+    let motion_norm = (feat.motion_band_power / 250.0).clamp(0.0, 1.0);
     let sp_norm = (feat.spectral_power / 500.0).clamp(0.0, 1.0);
+    var_norm * 0.40 + cp_norm * 0.20 + motion_norm * 0.25 + sp_norm * 0.15
+}
 
-    // Weighted composite — variance and change_points carry the most signal.
-    var_norm * 0.35 + cp_norm * 0.30 + motion_norm * 0.20 + sp_norm * 0.15
+/// Estimate person count via ruvector DynamicMinCut on the subcarrier
+/// temporal correlation graph.
+///
+/// Builds a graph where:
+/// - Nodes = active subcarriers (variance > noise floor)
+/// - Edges = Pearson correlation between subcarrier time series
+///   (weight = correlation coefficient; high correlation = heavy edge)
+/// - Source = virtual node connected to the most active subcarrier
+/// - Sink = virtual node connected to the least correlated subcarrier
+///
+/// The min-cut value indicates how many independent motion clusters exist:
+/// - High min-cut (relative to total edge weight) → one tightly coupled
+///   group → 1 person
+/// - Low min-cut → two loosely coupled groups → 2 persons
+///
+/// Uses `ruvector_mincut::DynamicMinCut` for O(V²E) exact max-flow.
+fn estimate_persons_from_correlation(frame_history: &VecDeque<Vec<f64>>) -> usize {
+    let n_frames = frame_history.len();
+    if n_frames < 10 {
+        return 1;
+    }
+
+    let window: Vec<&Vec<f64>> = frame_history.iter().rev().take(20).collect();
+    let n_sub = window[0].len().min(56);
+    if n_sub < 4 {
+        return 1;
+    }
+    let k = window.len() as f64;
+
+    // Per-subcarrier mean and variance
+    let mut means = vec![0.0f64; n_sub];
+    let mut variances = vec![0.0f64; n_sub];
+    for frame in &window {
+        for sc in 0..n_sub.min(frame.len()) {
+            means[sc] += frame[sc] / k;
+        }
+    }
+    for frame in &window {
+        for sc in 0..n_sub.min(frame.len()) {
+            variances[sc] += (frame[sc] - means[sc]).powi(2) / k;
+        }
+    }
+
+    // Active subcarriers: variance above noise floor
+    let noise_floor = 1.0;
+    let active: Vec<usize> = (0..n_sub).filter(|&sc| variances[sc] > noise_floor).collect();
+    let m = active.len();
+    if m < 3 {
+        return if m == 0 { 0 } else { 1 };
+    }
+
+    // Build correlation graph edges between active subcarriers.
+    // Edge weight = |Pearson correlation|. High correlation → same person.
+    let mut edges: Vec<(u64, u64, f64)> = Vec::new();
+    let source = m as u64;
+    let sink = (m + 1) as u64;
+
+    // Precompute std devs
+    let stds: Vec<f64> = active.iter().map(|&sc| variances[sc].sqrt().max(1e-9)).collect();
+
+    for i in 0..m {
+        for j in (i + 1)..m {
+            // Pearson correlation between subcarriers i and j
+            let mut cov = 0.0f64;
+            for frame in &window {
+                let si = active[i];
+                let sj = active[j];
+                if si < frame.len() && sj < frame.len() {
+                    cov += (frame[si] - means[si]) * (frame[sj] - means[sj]) / k;
+                }
+            }
+            let corr = (cov / (stds[i] * stds[j])).abs();
+            if corr > 0.1 {
+                // Bidirectional edges for flow network
+                let weight = corr * 10.0; // Scale up for integer-like flow
+                edges.push((i as u64, j as u64, weight));
+                edges.push((j as u64, i as u64, weight));
+            }
+        }
+    }
+
+    // Source → highest-variance subcarrier, Sink → lowest-variance
+    let (max_var_idx, _) = active.iter().enumerate()
+        .max_by(|(_, &a), (_, &b)| variances[a].partial_cmp(&variances[b]).unwrap())
+        .unwrap_or((0, &0));
+    let (min_var_idx, _) = active.iter().enumerate()
+        .min_by(|(_, &a), (_, &b)| variances[a].partial_cmp(&variances[b]).unwrap())
+        .unwrap_or((0, &0));
+
+    if max_var_idx == min_var_idx {
+        return 1;
+    }
+
+    edges.push((source, max_var_idx as u64, 100.0));
+    edges.push((min_var_idx as u64, sink, 100.0));
+
+    // Run min-cut
+    let mc: DynamicMinCut = match MinCutBuilder::new().exact().with_edges(edges.clone()).build() {
+        Ok(mc) => mc,
+        Err(_) => return 1,
+    };
+
+    let cut_value = mc.min_cut_value();
+    let total_edge_weight: f64 = edges.iter()
+        .filter(|(s, t, _)| *s != source && *s != sink && *t != source && *t != sink)
+        .map(|(_, _, w)| w)
+        .sum::<f64>() / 2.0; // bidirectional → halve
+
+    if total_edge_weight < 1e-9 {
+        return 1;
+    }
+
+    // Normalized cut ratio: low = easy to split = multiple people
+    let cut_ratio = cut_value / total_edge_weight;
+
+    if cut_ratio > 0.4 {
+        1 // Tightly coupled — one person
+    } else if cut_ratio > 0.15 {
+        2 // Moderately separable — two people
+    } else {
+        3 // Highly separable — three+ people
+    }
 }
 
 /// Convert smoothed person score to discrete count with hysteresis.
 ///
-/// Uses asymmetric thresholds: higher threshold to add a person, lower to remove.
-/// This prevents flickering at the boundary.
-fn score_to_person_count(smoothed_score: f64) -> usize {
-    // Thresholds chosen conservatively for single-ESP32 link:
-    //   score > 0.50 → 2 persons (needs sustained high variance + change points)
-    //   score > 0.80 → 3 persons (very high activity, rare with single link)
-    if smoothed_score > 0.80 {
-        3
-    } else if smoothed_score > 0.50 {
-        2
-    } else {
-        1
+/// Uses asymmetric thresholds: higher threshold to *add* a person, lower to
+/// *drop* one.  This prevents flickering when the score hovers near a boundary
+/// (the #1 user-reported issue — see #237, #249, #280, #292).
+fn score_to_person_count(smoothed_score: f64, prev_count: usize) -> usize {
+    // Up-thresholds (must exceed to increase count):
+    //   1→2: 0.80  (raised from 0.65 — single-person movement in multipath
+    //               rooms easily hits 0.65, causing false 2-person detection)
+    //   2→3: 0.92  (raised from 0.85 — 3 persons needs very strong signal)
+    // Down-thresholds (must drop below to decrease count):
+    //   2→1: 0.55  (hysteresis gap of 0.25)
+    //   3→2: 0.78  (hysteresis gap of 0.14)
+    match prev_count {
+        0 | 1 => {
+            if smoothed_score > 0.85 {
+                3
+            } else if smoothed_score > 0.70 {
+                2
+            } else {
+                1
+            }
+        }
+        2 => {
+            if smoothed_score > 0.92 {
+                3
+            } else if smoothed_score < 0.55 {
+                1
+            } else {
+                2 // hold — within hysteresis band
+            }
+        }
+        _ => {
+            // prev_count >= 3
+            if smoothed_score < 0.55 {
+                1
+            } else if smoothed_score < 0.78 {
+                2
+            } else {
+                3 // hold
+            }
+        }
     }
 }
 
@@ -1770,23 +2342,27 @@ fn derive_single_person_pose(
     let breath_phase = if let Some(ref vs) = update.vital_signs {
         let bpm = vs.breathing_rate_bpm.unwrap_or(15.0);
         let freq = (bpm / 60.0).clamp(0.1, 0.5);
-        (update.tick as f64 * freq * 0.1 * std::f64::consts::TAU + phase_offset).sin()
+        // Slow tick rate (0.02) for gentle breathing, not jerky oscillation.
+        (update.tick as f64 * freq * 0.02 * std::f64::consts::TAU + phase_offset).sin()
     } else {
-        (update.tick as f64 * 0.08 + feat.breathing_band_power + phase_offset).sin()
+        (update.tick as f64 * 0.02 + phase_offset).sin()
     };
 
     let lean_x = (feat.dominant_freq_hz / 5.0 - 1.0).clamp(-1.0, 1.0) * 18.0;
 
     let stride_x = if is_walking {
-        let stride_phase = (feat.motion_band_power * 0.7 + update.tick as f64 * 0.12 + phase_offset).sin();
-        stride_phase * 45.0 * motion_score
+        let stride_phase = (feat.motion_band_power * 0.7 + update.tick as f64 * 0.06 + phase_offset).sin();
+        stride_phase * 20.0 * motion_score
     } else {
         0.0
     };
 
-    let burst = (feat.change_points as f64 / 8.0).clamp(0.0, 1.0);
+    // Dampen burst and noise to reduce jitter.  The original used
+    // tick*17.3 which changed wildly every frame.  Now use slow tick
+    // rate and minimal burst scaling for a stable skeleton.
+    let burst = (feat.change_points as f64 / 20.0).clamp(0.0, 0.3);
 
-    let noise_seed = feat.variance * 31.7 + update.tick as f64 * 17.3 + person_idx as f64 * 97.1;
+    let noise_seed = person_idx as f64 * 97.1; // stable per-person, no tick
     let noise_val = (noise_seed.sin() * 43758.545).fract();
 
     let snr_factor = ((feat.variance - 0.5) / 10.0).clamp(0.0, 1.0);
@@ -1847,9 +2423,10 @@ fn derive_single_person_pose(
 
             let extremity_jitter = if EXTREMITY_KP.contains(&i) {
                 let phase = noise_seed + i as f64 * 2.399;
+                // Dampened from 12/8 to 4/3 to reduce visual jumping.
                 (
-                    phase.sin() * burst * motion_score * 12.0,
-                    (phase * 1.31).cos() * burst * motion_score * 8.0,
+                    phase.sin() * burst * motion_score * 4.0,
+                    (phase * 1.31).cos() * burst * motion_score * 3.0,
                 )
             } else {
                 (0.0, 0.0)
@@ -1928,6 +2505,95 @@ fn derive_pose_from_sensing(update: &SensingUpdate) -> Vec<PersonDetection> {
         .collect()
 }
 
+// ── RuVector Phase 2: Temporal EMA smoothing for keypoints ──────────────────
+
+/// Expected bone lengths in pixel-space for the COCO-17 skeleton as used by
+/// `derive_single_person_pose`. Pairs are (parent_idx, child_idx).
+const POSE_BONE_PAIRS: &[(usize, usize)] = &[
+    (5, 7), (7, 9), (6, 8), (8, 10),   // arms
+    (5, 11), (6, 12),                     // torso
+    (11, 13), (13, 15), (12, 14), (14, 16), // legs
+    (5, 6), (11, 12),                     // shoulders, hips
+];
+
+/// Apply temporal EMA smoothing and bone-length clamping to person detections.
+///
+/// For the *first* person (index 0) this uses the per-node `prev_keypoints`
+/// state. Multi-person smoothing is left for a future phase.
+fn apply_temporal_smoothing(persons: &mut [PersonDetection], ns: &mut NodeState) {
+    if persons.is_empty() {
+        return;
+    }
+
+    let alpha = ns.ema_alpha();
+    let person = &mut persons[0]; // smooth primary person only
+
+    let current_kps: Vec<[f64; 3]> = person.keypoints.iter()
+        .map(|kp| [kp.x, kp.y, kp.z])
+        .collect();
+
+    let smoothed = if let Some(ref prev) = ns.prev_keypoints {
+        let mut out = Vec::with_capacity(current_kps.len());
+        for (cur, prv) in current_kps.iter().zip(prev.iter()) {
+            out.push([
+                alpha * cur[0] + (1.0 - alpha) * prv[0],
+                alpha * cur[1] + (1.0 - alpha) * prv[1],
+                alpha * cur[2] + (1.0 - alpha) * prv[2],
+            ]);
+        }
+        // Clamp bone lengths to ±20% of previous frame.
+        clamp_bone_lengths_f64(&mut out, prev);
+        out
+    } else {
+        current_kps.clone()
+    };
+
+    // Write smoothed keypoints back into the person detection.
+    for (kp, s) in person.keypoints.iter_mut().zip(smoothed.iter()) {
+        kp.x = s[0];
+        kp.y = s[1];
+        kp.z = s[2];
+    }
+
+    ns.prev_keypoints = Some(smoothed);
+}
+
+/// Clamp bone lengths so no bone changes by more than MAX_BONE_CHANGE_RATIO
+/// compared to the previous frame.
+fn clamp_bone_lengths_f64(pose: &mut Vec<[f64; 3]>, prev: &[[f64; 3]]) {
+    for &(p, c) in POSE_BONE_PAIRS {
+        if p >= pose.len() || c >= pose.len() {
+            continue;
+        }
+        let prev_len = dist_f64(&prev[p], &prev[c]);
+        if prev_len < 1e-6 {
+            continue;
+        }
+        let cur_len = dist_f64(&pose[p], &pose[c]);
+        if cur_len < 1e-6 {
+            continue;
+        }
+        let ratio = cur_len / prev_len;
+        let lo = 1.0 - MAX_BONE_CHANGE_RATIO;
+        let hi = 1.0 + MAX_BONE_CHANGE_RATIO;
+        if ratio < lo || ratio > hi {
+            let target = prev_len * ratio.clamp(lo, hi);
+            let scale = target / cur_len;
+            for dim in 0..3 {
+                let diff = pose[c][dim] - pose[p][dim];
+                pose[c][dim] = pose[p][dim] + diff * scale;
+            }
+        }
+    }
+}
+
+fn dist_f64(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let dz = b[2] - a[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
 // ── DensePose-compatible REST endpoints ─────────────────────────────────────
 
 async fn health_live(State(state): State<SharedState>) -> Json<serde_json::Value> {
@@ -1942,7 +2608,7 @@ async fn health_ready(State(state): State<SharedState>) -> Json<serde_json::Valu
     let s = state.read().await;
     Json(serde_json::json!({
         "status": "ready",
-        "source": s.source,
+        "source": s.effective_source(),
     }))
 }
 
@@ -1953,7 +2619,10 @@ async fn health_system(State(state): State<SharedState>) -> Json<serde_json::Val
         "status": "healthy",
         "components": {
             "api": { "status": "healthy", "message": "Rust Axum server" },
-            "hardware": { "status": "healthy", "message": format!("Source: {}", s.source) },
+            "hardware": {
+                "status": if s.effective_source().ends_with(":offline") { "degraded" } else { "healthy" },
+                "message": format!("Source: {}", s.effective_source())
+            },
             "pose": { "status": "healthy", "message": "WiFi-derived pose estimation" },
             "stream": { "status": if s.tx.receiver_count() > 0 { "healthy" } else { "idle" },
                         "message": format!("{} client(s)", s.tx.receiver_count()) },
@@ -1993,7 +2662,7 @@ async fn api_info(State(state): State<SharedState>) -> Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "environment": "production",
         "backend": "rust",
-        "source": s.source,
+        "source": s.effective_source(),
         "features": {
             "wifi_sensing": true,
             "pose_estimation": true,
@@ -2007,14 +2676,14 @@ async fn api_info(State(state): State<SharedState>) -> Json<serde_json::Value> {
 async fn pose_current(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     let persons = match &s.latest_update {
-        Some(update) => derive_pose_from_sensing(update),
+        Some(update) => update.persons.clone().unwrap_or_else(|| derive_pose_from_sensing(update)),
         None => vec![],
     };
     Json(serde_json::json!({
         "timestamp": chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
         "persons": persons,
         "total_persons": persons.len(),
-        "source": s.source,
+        "source": s.effective_source(),
     }))
 }
 
@@ -2024,7 +2693,7 @@ async fn pose_stats(State(state): State<SharedState>) -> Json<serde_json::Value>
         "total_detections": s.total_detections,
         "average_confidence": 0.87,
         "frames_processed": s.tick,
-        "source": s.source,
+        "source": s.effective_source(),
     }))
 }
 
@@ -2048,7 +2717,7 @@ async fn stream_status(State(state): State<SharedState>) -> Json<serde_json::Val
         "active": true,
         "clients": s.tx.receiver_count(),
         "fps": if s.tick > 1 { 10u64 } else { 0u64 },
-        "source": s.source,
+        "source": s.effective_source(),
     }))
 }
 
@@ -2558,6 +3227,88 @@ async fn adaptive_unload(State(state): State<SharedState>) -> Json<serde_json::V
     Json(serde_json::json!({ "success": true, "message": "Adaptive model unloaded." }))
 }
 
+// ── Field model calibration endpoints (eigenvalue person counting) ──────────
+
+async fn calibration_start(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    // Guard: don't discard an in-progress or fresh calibration
+    if let Some(ref fm) = s.field_model {
+        match fm.status() {
+            CalibrationStatus::Collecting => {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "error": "Calibration already in progress. Call /calibration/stop first.",
+                    "frame_count": fm.calibration_frame_count(),
+                }));
+            }
+            CalibrationStatus::Fresh => {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "error": "A fresh calibration already exists. Call /calibration/stop or wait for expiry.",
+                }));
+            }
+            _ => {} // Stale/Expired/Uncalibrated — ok to recalibrate
+        }
+    }
+    match FieldModel::new(field_bridge::single_link_config()) {
+        Ok(fm) => {
+            s.field_model = Some(fm);
+            Json(serde_json::json!({
+                "success": true,
+                "message": "Calibration started — keep room empty while frames accumulate.",
+            }))
+        }
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": format!("{e}"),
+        })),
+    }
+}
+
+async fn calibration_stop(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let mut s = state.write().await;
+    if let Some(ref mut fm) = s.field_model {
+        let ts = chrono::Utc::now().timestamp_micros() as u64;
+        match fm.finalize_calibration(ts, 0) {
+            Ok(modes) => {
+                let baseline = modes.baseline_eigenvalue_count;
+                let variance_explained = modes.variance_explained;
+                info!("Field model calibrated: baseline_eigenvalues={baseline}, variance_explained={variance_explained:.2}");
+                Json(serde_json::json!({
+                    "success": true,
+                    "baseline_eigenvalue_count": baseline,
+                    "variance_explained": variance_explained,
+                    "frame_count": fm.calibration_frame_count(),
+                }))
+            }
+            Err(e) => Json(serde_json::json!({
+                "success": false,
+                "error": format!("{e}"),
+            })),
+        }
+    } else {
+        Json(serde_json::json!({
+            "success": false,
+            "error": "No field model active — call /calibration/start first.",
+        }))
+    }
+}
+
+async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    match s.field_model.as_ref() {
+        Some(fm) => Json(serde_json::json!({
+            "active": true,
+            "status": format!("{:?}", fm.status()),
+            "frame_count": fm.calibration_frame_count(),
+        })),
+        None => Json(serde_json::json!({
+            "active": false,
+            "status": "none",
+        })),
+    }
+}
+
 /// Generate a simple timestamp string (epoch seconds) for recording IDs.
 fn chrono_timestamp() -> u64 {
     std::time::SystemTime::now()
@@ -2584,7 +3335,7 @@ async fn vital_signs_endpoint(State(state): State<SharedState>) -> Json<serde_js
             "heartbeat_samples": hb_len,
             "heartbeat_capacity": hb_cap,
         },
-        "source": s.source,
+        "source": s.effective_source(),
         "tick": s.tick,
     }))
 }
@@ -2704,6 +3455,34 @@ async fn sona_activate(
     }
 }
 
+/// GET /api/v1/nodes — per-node health and feature info.
+async fn nodes_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let now = std::time::Instant::now();
+    let nodes: Vec<serde_json::Value> = s.node_states.iter()
+        .map(|(&id, ns)| {
+            let elapsed_ms = ns.last_frame_time
+                .map(|t| now.duration_since(t).as_millis() as u64)
+                .unwrap_or(999999);
+            let stale = elapsed_ms > 5000;
+            let status = if stale { "stale" } else { "active" };
+            let rssi = ns.rssi_history.back().copied().unwrap_or(-90.0);
+            serde_json::json!({
+                "node_id": id,
+                "status": status,
+                "last_seen_ms": elapsed_ms,
+                "rssi_dbm": rssi,
+                "motion_level": &ns.current_motion_level,
+                "person_count": ns.prev_person_count,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "nodes": nodes,
+        "total": nodes.len(),
+    }))
+}
+
 async fn info_page() -> Html<String> {
     Html(format!(
         "<html><body>\
@@ -2761,6 +3540,158 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     })) {
                         let _ = s.tx.send(json);
                     }
+
+                    // Issue #323: Also emit a sensing_update so the UI renders
+                    // detections for ESP32 nodes running the edge DSP pipeline
+                    // (Tier 2+).  Without this, vitals arrive but the UI shows
+                    // "no detection" because it only renders sensing_update msgs.
+                    s.source = "esp32".to_string();
+                    s.last_esp32_frame = Some(std::time::Instant::now());
+
+                    // ── Per-node state for edge vitals (issue #249) ──────
+                    let node_id = vitals.node_id;
+                    let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
+                    ns.last_frame_time = Some(std::time::Instant::now());
+                    ns.edge_vitals = Some(vitals.clone());
+                    ns.rssi_history.push_back(vitals.rssi as f64);
+                    if ns.rssi_history.len() > 60 { ns.rssi_history.pop_front(); }
+
+                    // Store per-node person count from edge vitals.
+                    let node_est = if vitals.presence {
+                        (vitals.n_persons as usize).max(1)
+                    } else {
+                        0
+                    };
+                    ns.prev_person_count = node_est;
+
+                    s.tick += 1;
+                    let tick = s.tick;
+
+                    let motion_level = if vitals.motion { "present_moving" }
+                        else if vitals.presence { "present_still" }
+                        else { "absent" };
+                    let motion_score = if vitals.motion { 0.8 }
+                        else if vitals.presence { 0.3 }
+                        else { 0.05 };
+
+                    // Aggregate person count: gate on presence first (matching WiFi path).
+                    let now = std::time::Instant::now();
+                    let total_persons = if vitals.presence {
+                        let (fused, fallback_count) = multistatic_bridge::fuse_or_fallback(
+                            &s.multistatic_fuser, &s.node_states,
+                        );
+                        match fused {
+                            Some(ref f) => {
+                                let score = multistatic_bridge::compute_person_score_from_amplitudes(&f.fused_amplitude);
+                                s.smoothed_person_score = s.smoothed_person_score * 0.90 + score * 0.10;
+                                let count = s.person_count();
+                                s.prev_person_count = count;
+                                count.max(1) // presence=true => at least 1
+                            }
+                            None => fallback_count.unwrap_or(0).max(1),
+                        }
+                    } else {
+                        s.prev_person_count = 0;
+                        0
+                    };
+
+                    // Feed field model calibration if active (use per-node history for ESP32).
+                    if let Some(ref mut fm) = s.field_model {
+                        if let Some(ns) = s.node_states.get(&node_id) {
+                            field_bridge::maybe_feed_calibration(fm, &ns.frame_history);
+                        }
+                    }
+
+                    // Build nodes array with all active nodes.
+                    let active_nodes: Vec<NodeInfo> = s.node_states.iter()
+                        .filter(|(_, n)| n.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
+                        .map(|(&id, n)| NodeInfo {
+                            node_id: id,
+                            rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
+                            position: [2.0, 0.0, 1.5],
+                            amplitude: vec![],
+                            subcarrier_count: 0,
+                        })
+                        .collect();
+
+                    let features = FeatureInfo {
+                        mean_rssi: vitals.rssi as f64,
+                        variance: vitals.motion_energy as f64,
+                        motion_band_power: vitals.motion_energy as f64,
+                        breathing_band_power: if vitals.presence { 0.5 } else { 0.0 },
+                        dominant_freq_hz: vitals.breathing_rate_bpm / 60.0,
+                        change_points: 0,
+                        spectral_power: vitals.motion_energy as f64,
+                    };
+
+                    // Store latest features on node for cross-node fusion.
+                    s.node_states.get_mut(&node_id)
+                        .map(|ns| ns.latest_features = Some(features.clone()));
+
+                    // Cross-node fusion: combine features from all active nodes.
+                    let fused_features = fuse_multi_node_features(&features, &s.node_states);
+
+                    let mut classification = ClassificationInfo {
+                        motion_level: motion_level.to_string(),
+                        presence: vitals.presence,
+                        confidence: vitals.presence_score as f64,
+                    };
+
+                    // Boost classification confidence with multi-node coverage.
+                    let n_active = s.node_states.values()
+                        .filter(|ns| ns.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
+                        .count();
+                    if n_active > 1 {
+                        classification.confidence = (classification.confidence
+                            * (1.0 + 0.15 * (n_active as f64 - 1.0))).clamp(0.0, 1.0);
+                    }
+
+                    let signal_field = generate_signal_field(
+                        fused_features.mean_rssi, motion_score, vitals.breathing_rate_bpm / 60.0,
+                        (vitals.presence_score as f64).min(1.0), &[],
+                    );
+
+                    let mut update = SensingUpdate {
+                        msg_type: "sensing_update".to_string(),
+                        timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+                        source: "esp32".to_string(),
+                        tick,
+                        nodes: active_nodes,
+                        features: fused_features.clone(),
+                        classification,
+                        signal_field,
+                        vital_signs: Some(VitalSigns {
+                            breathing_rate_bpm: if vitals.breathing_rate_bpm > 0.0 { Some(vitals.breathing_rate_bpm) } else { None },
+                            heart_rate_bpm: if vitals.heartrate_bpm > 0.0 { Some(vitals.heartrate_bpm) } else { None },
+                            breathing_confidence: if vitals.presence { 0.7 } else { 0.0 },
+                            heartbeat_confidence: if vitals.presence { 0.7 } else { 0.0 },
+                            signal_quality: vitals.presence_score as f64,
+                        }),
+                        enhanced_motion: None,
+                        enhanced_breathing: None,
+                        posture: None,
+                        signal_quality_score: None,
+                        quality_verdict: None,
+                        bssid_count: None,
+                        pose_keypoints: None,
+                        model_status: None,
+                        persons: None,
+                        estimated_persons: if total_persons > 0 { Some(total_persons) } else { None },
+                        node_features: None,
+                    };
+
+                    let raw_persons = derive_pose_from_sensing(&update);
+                    let tracked = tracker_bridge::tracker_update(
+                        &mut s.pose_tracker, &mut s.last_tracker_instant, raw_persons,
+                    );
+                    if !tracked.is_empty() {
+                        update.persons = Some(tracked);
+                    }
+
+                    if let Ok(json) = serde_json::to_string(&update) {
+                        let _ = s.tx.send(json);
+                    }
+                    s.latest_update = Some(update);
                     s.edge_vitals = Some(vitals);
                     continue;
                 }
@@ -2790,25 +3721,99 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let mut s = state.write().await;
                     s.source = "esp32".to_string();
+                    s.last_esp32_frame = Some(std::time::Instant::now());
 
-                    // Append current amplitudes to history before extracting features so
-                    // that temporal analysis includes the most recent frame.
+                    // Also maintain global frame_history for backward compat
+                    // (simulation path, REST endpoints, etc.).
                     s.frame_history.push_back(frame.amplitudes.clone());
                     if s.frame_history.len() > FRAME_HISTORY_CAPACITY {
                         s.frame_history.pop_front();
                     }
 
-                    let sample_rate_hz = 1000.0 / 500.0_f64; // default tick; ESP32 frames arrive as fast as they come
-                    let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
-                        extract_features_from_frame(&frame, &s.frame_history, sample_rate_hz);
-                    smooth_and_classify(&mut s, &mut classification, raw_motion);
-    adaptive_override(&s, &features, &mut classification);
+                    // ── Per-node processing (issue #249) ──────────────────
+                    // Process entirely within per-node state so different
+                    // ESP32 nodes never mix their smoothing/vitals buffers.
+                    // We scope the mutable borrow of node_states so we can
+                    // access other AppStateInner fields afterward.
+                    let node_id = frame.node_id;
+                    // Clone adaptive model before mutable borrow of node_states
+                    // to avoid unsafe raw pointer (review finding #2).
+                    let adaptive_model_clone = s.adaptive_model.clone();
 
-                    // Update RSSI history
+                    let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
+                    ns.last_frame_time = Some(std::time::Instant::now());
+
+                    ns.frame_history.push_back(frame.amplitudes.clone());
+                    if ns.frame_history.len() > FRAME_HISTORY_CAPACITY {
+                        ns.frame_history.pop_front();
+                    }
+
+                    let sample_rate_hz = 1000.0 / 500.0_f64;
+                    let (features, mut classification, breathing_rate_hz, sub_variances, raw_motion) =
+                        extract_features_from_frame(&frame, &ns.frame_history, sample_rate_hz);
+                    smooth_and_classify_node(ns, &mut classification, raw_motion);
+
+                    // Adaptive override using cloned model (safe, no raw pointers).
+                    if let Some(ref model) = adaptive_model_clone {
+                        let amps = ns.frame_history.back()
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
+                        let feat_arr = adaptive_classifier::features_from_runtime(
+                            &serde_json::json!({
+                                "variance": features.variance,
+                                "motion_band_power": features.motion_band_power,
+                                "breathing_band_power": features.breathing_band_power,
+                                "spectral_power": features.spectral_power,
+                                "dominant_freq_hz": features.dominant_freq_hz,
+                                "change_points": features.change_points,
+                                "mean_rssi": features.mean_rssi,
+                            }),
+                            amps,
+                        );
+                        let (label, conf) = model.classify(&feat_arr);
+                        classification.motion_level = label.to_string();
+                        classification.presence = label != "absent";
+                        classification.confidence = (conf * 0.7 + classification.confidence * 0.3).clamp(0.0, 1.0);
+                    }
+
+                    ns.rssi_history.push_back(features.mean_rssi);
+                    if ns.rssi_history.len() > 60 {
+                        ns.rssi_history.pop_front();
+                    }
+
+                    let raw_vitals = ns.vital_detector.process_frame(
+                        &frame.amplitudes,
+                        &frame.phases,
+                    );
+                    let vitals = smooth_vitals_node(ns, &raw_vitals);
+                    ns.latest_vitals = vitals.clone();
+
+                    // DynamicMinCut person estimation from subcarrier correlation.
+                    let corr_persons = estimate_persons_from_correlation(&ns.frame_history);
+                    let raw_score = corr_persons as f64 / 3.0;
+                    ns.smoothed_person_score = ns.smoothed_person_score * 0.92 + raw_score * 0.08;
+                    if classification.presence {
+                        let count = score_to_person_count(ns.smoothed_person_score, ns.prev_person_count);
+                        ns.prev_person_count = count;
+                    } else {
+                        ns.prev_person_count = 0;
+                    }
+
+                    // Store latest features on node for cross-node fusion.
+                    ns.latest_features = Some(features.clone());
+
+                    // Done with per-node mutable borrow; now read aggregated
+                    // state from all nodes (the borrow of `ns` ends here).
+                    // (We re-borrow node_states immutably via `s` below.)
+
                     s.rssi_history.push_back(features.mean_rssi);
                     if s.rssi_history.len() > 60 {
                         s.rssi_history.pop_front();
                     }
+                    s.latest_vitals = vitals.clone();
+
+                    // Cross-node fusion: combine features from all active nodes.
+                    let fused_features = fuse_multi_node_features(&features, &s.node_states);
 
                     s.tick += 1;
                     let tick = s.tick;
@@ -2817,39 +3822,59 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         else if classification.motion_level == "present_still" { 0.3 }
                         else { 0.05 };
 
-                    let raw_vitals = s.vital_detector.process_frame(
-                        &frame.amplitudes,
-                        &frame.phases,
-                    );
-                    let vitals = smooth_vitals(&mut s, &raw_vitals);
-                    s.latest_vitals = vitals.clone();
-
-                    // Multi-person estimation with temporal smoothing.
-                    let raw_score = compute_person_score(&features);
-                    s.smoothed_person_score = s.smoothed_person_score * 0.85 + raw_score * 0.15;
-                    let est_persons = if classification.presence {
-                        score_to_person_count(s.smoothed_person_score)
+                    // Aggregate person count: gate on presence first (matching WiFi path).
+                    let now = std::time::Instant::now();
+                    let total_persons = if classification.presence {
+                        let (fused, fallback_count) = multistatic_bridge::fuse_or_fallback(
+                            &s.multistatic_fuser, &s.node_states,
+                        );
+                        match fused {
+                            Some(ref f) => {
+                                let score = multistatic_bridge::compute_person_score_from_amplitudes(&f.fused_amplitude);
+                                s.smoothed_person_score = s.smoothed_person_score * 0.90 + score * 0.10;
+                                let count = s.person_count();
+                                s.prev_person_count = count;
+                                count.max(1)
+                            }
+                            None => fallback_count.unwrap_or(0).max(1),
+                        }
                     } else {
+                        s.prev_person_count = 0;
                         0
                     };
+
+                    // Feed field model calibration if active (use per-node history for ESP32).
+                    if let Some(ref mut fm) = s.field_model {
+                        if let Some(ns) = s.node_states.get(&node_id) {
+                            field_bridge::maybe_feed_calibration(fm, &ns.frame_history);
+                        }
+                    }
+
+                    // Build nodes array with all active nodes.
+                    let active_nodes: Vec<NodeInfo> = s.node_states.iter()
+                        .filter(|(_, n)| n.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
+                        .map(|(&id, n)| NodeInfo {
+                            node_id: id,
+                            rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
+                            position: [2.0, 0.0, 1.5],
+                            amplitude: n.frame_history.back()
+                                .map(|a| a.iter().take(56).cloned().collect())
+                                .unwrap_or_default(),
+                            subcarrier_count: n.frame_history.back().map_or(0, |a| a.len()),
+                        })
+                        .collect();
 
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
                         source: "esp32".to_string(),
                         tick,
-                        nodes: vec![NodeInfo {
-                            node_id: frame.node_id,
-                            rssi_dbm: features.mean_rssi,
-                            position: [2.0, 0.0, 1.5],
-                            amplitude: frame.amplitudes.iter().take(56).cloned().collect(),
-                            subcarrier_count: frame.n_subcarriers as usize,
-                        }],
-                        features: features.clone(),
+                        nodes: active_nodes,
+                        features: fused_features.clone(),
                         classification,
                         signal_field: generate_signal_field(
-                            features.mean_rssi, motion_score, breathing_rate_hz,
-                            features.variance.min(1.0), &sub_variances,
+                            fused_features.mean_rssi, motion_score, breathing_rate_hz,
+                            fused_features.variance.min(1.0), &sub_variances,
                         ),
                         vital_signs: Some(vitals),
                         enhanced_motion: None,
@@ -2861,18 +3886,35 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         pose_keypoints: None,
                         model_status: None,
                         persons: None,
-                        estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
+                        estimated_persons: if total_persons > 0 { Some(total_persons) } else { None },
+                        node_features: None,
                     };
 
-                    let persons = derive_pose_from_sensing(&update);
-                    if !persons.is_empty() {
-                        update.persons = Some(persons);
+                    let raw_persons = derive_pose_from_sensing(&update);
+                    let tracked = tracker_bridge::tracker_update(
+                        &mut s.pose_tracker, &mut s.last_tracker_instant, raw_persons,
+                    );
+                    if !tracked.is_empty() {
+                        update.persons = Some(tracked);
                     }
 
                     if let Ok(json) = serde_json::to_string(&update) {
                         let _ = s.tx.send(json);
                     }
                     s.latest_update = Some(update);
+
+                    // Evict stale nodes every 100 ticks to prevent memory leak.
+                    if tick % 100 == 0 {
+                        let stale = Duration::from_secs(60);
+                        let before = s.node_states.len();
+                        s.node_states.retain(|_id, ns| {
+                            ns.last_frame_time.map_or(false, |t| now.duration_since(t) < stale)
+                        });
+                        let evicted = before - s.node_states.len();
+                        if evicted > 0 {
+                            info!("Evicted {} stale node(s), {} active", evicted, s.node_states.len());
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -2929,12 +3971,15 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         let frame_amplitudes = frame.amplitudes.clone();
         let frame_n_sub = frame.n_subcarriers;
 
-        // Multi-person estimation with temporal smoothing.
+        // Multi-person estimation with temporal smoothing (EMA α=0.10).
         let raw_score = compute_person_score(&features);
-        s.smoothed_person_score = s.smoothed_person_score * 0.85 + raw_score * 0.15;
+        s.smoothed_person_score = s.smoothed_person_score * 0.90 + raw_score * 0.10;
         let est_persons = if classification.presence {
-            score_to_person_count(s.smoothed_person_score)
+            let count = s.person_count();
+            s.prev_person_count = count;
+            count
         } else {
+            s.prev_person_count = 0;
             0
         };
 
@@ -2977,12 +4022,16 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             },
             persons: None,
             estimated_persons: if est_persons > 0 { Some(est_persons) } else { None },
+            node_features: None,
         };
 
-        // Populate persons from the sensing update.
-        let persons = derive_pose_from_sensing(&update);
-        if !persons.is_empty() {
-            update.persons = Some(persons);
+        // Populate persons from the sensing update (Kalman-smoothed via tracker).
+        let raw_persons = derive_pose_from_sensing(&update);
+        let tracked = tracker_bridge::tracker_update(
+            &mut s.pose_tracker, &mut s.last_tracker_instant, raw_persons,
+        );
+        if !tracked.is_empty() {
+            update.persons = Some(tracked);
         }
 
         if update.classification.presence {
@@ -3566,6 +4615,7 @@ async fn main() {
         frame_history: VecDeque::new(),
         tick: 0,
         source: source.into(),
+        last_esp32_frame: None,
         tx,
         total_detections: 0,
         start_time: std::time::Instant::now(),
@@ -3577,6 +4627,7 @@ async fn main() {
         active_sona_profile: None,
         model_loaded,
         smoothed_person_score: 0.0,
+        prev_person_count: 0,
         smoothed_motion: 0.0,
         current_motion_level: "absent".to_string(),
         debounce_counter: 0,
@@ -3608,6 +4659,30 @@ async fn main() {
                   m.trained_frames, m.training_accuracy * 100.0);
             m
         }),
+        node_states: HashMap::new(),
+        // Accuracy sprint
+        pose_tracker: PoseTracker::new(),
+        last_tracker_instant: None,
+        multistatic_fuser: {
+            let mut fuser = MultistaticFuser::with_config(MultistaticConfig {
+                min_nodes: 1, // single-node passthrough
+                ..Default::default()
+            });
+            if let Some(ref pos_str) = args.node_positions {
+                let positions = field_bridge::parse_node_positions(pos_str);
+                if !positions.is_empty() {
+                    info!("Configured {} node positions for multistatic fusion", positions.len());
+                    fuser.set_node_positions(positions);
+                }
+            }
+            fuser
+        },
+        field_model: if args.calibrate {
+            info!("Field model calibration enabled — room should be empty during startup");
+            FieldModel::new(field_bridge::single_link_config()).ok()
+        } else {
+            None
+        },
     }));
 
     // Start background tasks based on source
@@ -3661,6 +4736,8 @@ async fn main() {
         .route("/api/v1/metrics", get(health_metrics))
         // Sensing endpoints
         .route("/api/v1/sensing/latest", get(latest))
+        // Per-node health endpoint
+        .route("/api/v1/nodes", get(nodes_endpoint))
         // Vital sign endpoints
         .route("/api/v1/vital-signs", get(vital_signs_endpoint))
         .route("/api/v1/edge-vitals", get(edge_vitals_endpoint))
@@ -3702,6 +4779,10 @@ async fn main() {
         .route("/api/v1/adaptive/train", post(adaptive_train))
         .route("/api/v1/adaptive/status", get(adaptive_status))
         .route("/api/v1/adaptive/unload", post(adaptive_unload))
+        // Field model calibration (eigenvalue-based person counting)
+        .route("/api/v1/calibration/start", post(calibration_start))
+        .route("/api/v1/calibration/stop", post(calibration_stop))
+        .route("/api/v1/calibration/status", get(calibration_status))
         // Static UI files
         .nest_service("/ui", ServeDir::new(&ui_path))
         .layer(SetResponseHeaderLayer::overriding(
@@ -3739,7 +4820,7 @@ async fn main() {
             "WiFi DensePose sensing model state",
         );
         builder.add_metadata(&serde_json::json!({
-            "source": s.source,
+            "source": s.effective_source(),
             "total_ticks": s.tick,
             "total_detections": s.total_detections,
             "uptime_secs": s.start_time.elapsed().as_secs(),
